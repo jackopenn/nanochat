@@ -6,7 +6,7 @@ import os
 import time
 import argparse
 import torch
-from nanochat.tokenizer import RustBPETokenizer
+from nanochat.tokenizer import RustBPETokenizer, build_compressed_vocab
 from nanochat.common import get_base_dir
 from nanochat.dataset import parquets_iter_batched
 
@@ -89,6 +89,16 @@ token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
 with open(token_bytes_path, "wb") as f:
     torch.save(token_bytes, f)
 print(f"Saved token_bytes to {token_bytes_path}")
+
+# -----------------------------------------------------------------------------
+# Build and save the compressed vocabulary mapping for value embeddings.
+# Tokens that normalize to the same string (modulo case, accents, whitespace) share the same compressed ID.
+lookup_table, compressed_vocab_size = build_compressed_vocab(tokenizer)
+compressed_vocab_path = os.path.join(tokenizer_dir, "compressed_vocab.pt")
+with open(compressed_vocab_path, "wb") as f:
+    torch.save({"lookup_table": lookup_table, "compressed_vocab_size": compressed_vocab_size}, f)
+print(f"Compressed vocab size: {compressed_vocab_size:,} (from {vocab_size:,}, {compressed_vocab_size/vocab_size:.1%})")
+print(f"Saved compressed_vocab to {compressed_vocab_path}")
 
 # Log to report
 from nanochat.report import get_report

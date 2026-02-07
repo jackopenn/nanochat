@@ -27,7 +27,7 @@ import torch
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from nanochat.tokenizer import get_tokenizer, get_token_bytes, get_compressed_vocab
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
@@ -117,7 +117,9 @@ else:
 tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
+compressed_vocab_lookup, compressed_vocab_size = get_compressed_vocab(device=device)
 print0(f"Vocab size: {vocab_size:,}")
+print0(f"Compressed vocab size: {compressed_vocab_size:,} ({compressed_vocab_size/vocab_size:.1%} of original)")
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -133,6 +135,7 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        compressed_vocab_size=compressed_vocab_size,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -145,6 +148,7 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
+model.compressed_vocab_lookup[:vocab_size].copy_(compressed_vocab_lookup) # load compressed vocab mapping for VE lookup
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()

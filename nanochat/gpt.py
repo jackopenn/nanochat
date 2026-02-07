@@ -37,6 +37,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Compressed vocab size for value embeddings (0 = disabled, use vocab_size)
+    # Tokens that normalize to the same string share one VE row, reducing parameters.
+    compressed_vocab_size: int = 0
 
 
 def norm(x):
@@ -172,9 +175,16 @@ class GPT(nn.Module):
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
+        # Uses compressed vocab (tokens normalized modulo case/accents/whitespace share one row)
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        if config.compressed_vocab_size > 0:
+            ve_vocab = ((config.compressed_vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
+        else:
+            ve_vocab = padded_vocab_size
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(ve_vocab, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # Lookup table: maps token ids -> compressed ids for value embedding lookup
+        self.register_buffer("compressed_vocab_lookup", torch.zeros(padded_vocab_size, dtype=torch.long))
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -228,6 +238,9 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+
+        # Compressed vocab lookup: identity by default (overwritten by training script with actual mapping)
+        self.compressed_vocab_lookup.copy_(torch.arange(self.compressed_vocab_lookup.size(0)))
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -400,9 +413,10 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+        ve_idx = self.compressed_vocab_lookup[idx] # map token ids to compressed ids for value embeddings
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+            ve = self.value_embeds[str(i)](ve_idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 

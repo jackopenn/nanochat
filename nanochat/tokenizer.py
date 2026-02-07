@@ -7,7 +7,9 @@ Two implementations are available:
 """
 
 import os
+import re
 import copy
+import unicodedata
 from functools import lru_cache
 
 SPECIAL_TOKENS = [
@@ -404,3 +406,52 @@ def get_token_bytes(device="cpu"):
     with open(token_bytes_path, "rb") as f:
         token_bytes = torch.load(f, map_location=device)
     return token_bytes
+
+def _normalize_token(text):
+    """Normalize a token string for compressed vocabulary mapping.
+    Tokens that normalize to the same string will share one embedding row.
+    Follows DeepSeek Engram: NFKC -> NFD -> strip accents -> lowercase -> collapse whitespace -> strip."""
+    text = unicodedata.normalize('NFKC', text)
+    text = unicodedata.normalize('NFD', text)
+    text = ''.join(c for c in text if unicodedata.category(c) != 'Mn')  # strip combining marks (accents)
+    text = text.lower()
+    text = re.sub(r'[ \t\r\n]+', ' ', text)
+    text = text.strip()
+    return text
+
+def build_compressed_vocab(tokenizer):
+    """Build a compressed vocabulary mapping from a tokenizer.
+    Tokens that normalize to the same string (modulo case, accents, whitespace) share the same compressed ID.
+    Returns (lookup_table, compressed_vocab_size) where lookup_table is a LongTensor of shape (vocab_size,)."""
+    import torch
+    vocab_size = tokenizer.get_vocab_size()
+    special_tokens = tokenizer.get_special_tokens()
+
+    key_to_new_id = {}
+    lookup = []
+    for tid in range(vocab_size):
+        text = tokenizer.decode([tid])
+        # Byte-fallback tokens decode to replacement character — use raw token repr as key
+        if '\ufffd' in text:
+            key = f"__byte_{tid}__"
+        else:
+            norm = _normalize_token(text)
+            key = norm if norm else text
+        if key not in key_to_new_id:
+            key_to_new_id[key] = len(key_to_new_id)
+        lookup.append(key_to_new_id[key])
+
+    compressed_vocab_size = len(key_to_new_id)
+    lookup_table = torch.tensor(lookup, dtype=torch.long)
+    return lookup_table, compressed_vocab_size
+
+def get_compressed_vocab(device="cpu"):
+    """Load the pre-computed compressed vocab lookup table and size (written by tok_train.py)."""
+    import torch
+    from nanochat.common import get_base_dir
+    base_dir = get_base_dir()
+    tokenizer_dir = os.path.join(base_dir, "tokenizer")
+    path = os.path.join(tokenizer_dir, "compressed_vocab.pt")
+    assert os.path.exists(path), f"Compressed vocab not found at {path}? It gets written by tok_train.py"
+    data = torch.load(path, map_location=device)
+    return data["lookup_table"], data["compressed_vocab_size"]
