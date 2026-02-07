@@ -50,7 +50,7 @@ class RMSNorm(nn.Module):
         self.scale = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        return F.rms_norm(x, (x.size(-1),)) * self.scale
+        return F.rms_norm(x, (x.size(-1),)) * self.scale.to(x.dtype)
 
 
 def has_ve(layer_idx, n_layer):
