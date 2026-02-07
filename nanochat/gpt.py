@@ -6,7 +6,7 @@ Notable features:
 - untied weights for token embedding and lm_head
 - relu^2 activation in MLP
 - norm after token embedding
-- no learnable params in rmsnorm
+- learnable RMSNorm for QK norm, parameter-free RMSNorm elsewhere
 - no bias in linear layers
 - Group-Query Attention (GQA) support for more efficient inference
 - Flash Attention 3 integration
@@ -44,6 +44,15 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return F.rms_norm(x, (x.size(-1),)) * self.scale
+
+
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
@@ -70,6 +79,8 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -91,7 +102,7 @@ class CausalSelfAttention(nn.Module):
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
+        q, k = self.q_norm(q), self.k_norm(k)
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
@@ -224,6 +235,11 @@ class GPT(nn.Module):
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
 
+        # QK norm scales init to 1.0 (identity)
+        for block in self.transformer.h:
+            block.attn.q_norm.scale.fill_(1.0)
+            block.attn.k_norm.scale.fill_(1.0)
+
         # Gate weights init to zero so gates start at sigmoid(0) = 0.5, scaled by 2 -> 1.0 (neutral)
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
@@ -302,10 +318,11 @@ class GPT(nn.Module):
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
         nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and per-layer scalars
+        # Exclude non-matmul params: embeddings, per-layer scalars, and norm scales
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        norm_scales_numel = sum(p.numel() for p in self.transformer.h.parameters() if p.ndim == 1)
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+                          norm_scales_numel + self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -332,15 +349,17 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters() if p.ndim >= 2)
+        norm_scales = sum(p.numel() for p in self.transformer.h.parameters() if p.ndim == 1)
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + transformer_matrices + norm_scales + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'norm_scales': norm_scales,
             'scalars': scalars,
             'total': total,
         }
@@ -350,13 +369,16 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Split transformer.h params: 2D+ go to Muon, 1D (e.g. RMSNorm scales) go to AdamW
+        all_h_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_h_params if p.ndim >= 2]
+        norm_params = [p for p in all_h_params if p.ndim == 1]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(norm_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -368,6 +390,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=norm_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
