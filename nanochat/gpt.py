@@ -144,7 +144,7 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, config, pad_vocab_size_to=64):
+    def __init__(self, config, pad_vocab_size_to=64, z_loss_weight=0.0, logit_softcap=True):
         """
         NOTE a major footgun: this __init__ function runs in meta device context (!!)
         Therefore, any calculations inside here are shapes and dtypes only, no actual data.
@@ -152,6 +152,8 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        self.z_loss_weight = z_loss_weight
+        self.logit_softcap = logit_softcap
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -345,7 +347,7 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5, lm_head_wd=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -365,7 +367,7 @@ class GPT(nn.Module):
         # Build param_groups with all required fields explicit
         param_groups = [
             # AdamW groups (embeddings, lm_head, scalars)
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=lm_head_wd),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
@@ -407,16 +409,22 @@ class GPT(nn.Module):
         x = norm(x)
 
         # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        logits = logits.float() # switch to fp32 for loss computation
+        self.max_logit = logits.detach().max() # track before any squashing (0-dim GPU tensor, no sync)
+        if self.logit_softcap:
+            logits = 15 * torch.tanh(logits / 15) # smoothly cap logits to [-15, 15]
 
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # z-loss: penalize large logits to stabilize training (replaces logit softcap)
+            if self.z_loss_weight > 0 and loss_reduction == 'mean':
+                log_z = logits.float().logsumexp(dim=-1) # (B, T)
+                z_loss = self.z_loss_weight * (log_z ** 2).mean()
+                loss = loss + z_loss
             return loss
         else:
             # inference: just return the logits directly

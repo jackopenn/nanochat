@@ -61,6 +61,9 @@ parser.add_argument("--total-batch-size", type=int, default=-1, help="total batc
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
+parser.add_argument("--lm-head-wd", type=float, default=0.0, help="weight decay for the lm_head (unembedding) parameters")
+parser.add_argument("--z-loss-weight", type=float, default=0.0, help="z-loss penalty weight to stabilize logits (0 = disable)")
+parser.add_argument("--logit-softcap", action=argparse.BooleanOptionalAction, default=True, help="apply logit softcap (tanh squash to [-15, 15])")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
@@ -135,7 +138,7 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
-        model_meta = GPT(config)
+        model_meta = GPT(config, z_loss_weight=args.z_loss_weight, logit_softcap=args.logit_softcap)
     return model_meta
 
 # Build the model, move to device, init the weights
@@ -302,6 +305,7 @@ optimizer = model.setup_optimizer(
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
     adam_betas=(args.adam_beta1, args.adam_beta2),
+    lm_head_wd=args.lm_head_wd,
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
@@ -541,6 +545,7 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "train/max_logit": model.max_logit.item(),
         }
         wandb_run.log(log_data)
 
