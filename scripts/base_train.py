@@ -51,6 +51,9 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--use-compressed-ve", action="store_true", help="use compressed tokenizer for value embedding lookup (case/accent-invariant)")
+parser.add_argument("--use-engrams", action="store_true", help="enable bigram hash embeddings blended into residual stream")
+parser.add_argument("--use-compressed-engrams", action="store_true", help="use compressed tokenizer for engram hashing (implies --use-engrams)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -117,9 +120,19 @@ else:
 tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
-compressed_vocab_lookup, compressed_vocab_size = get_compressed_vocab(device=device)
 print0(f"Vocab size: {vocab_size:,}")
-print0(f"Compressed vocab size: {compressed_vocab_size:,} ({compressed_vocab_size/vocab_size:.1%} of original)")
+
+# --use-compressed-engrams implies --use-engrams
+if args.use_compressed_engrams:
+    args.use_engrams = True
+
+# Load compressed vocab if needed by any feature
+use_compressed = args.use_compressed_ve or args.use_compressed_engrams
+if use_compressed:
+    compressed_vocab_lookup, compressed_vocab_size = get_compressed_vocab(device=device)
+    print0(f"Compressed vocab size: {compressed_vocab_size:,} ({compressed_vocab_size/vocab_size:.1%} of original)")
+else:
+    compressed_vocab_lookup, compressed_vocab_size = None, 0
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -136,6 +149,9 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         compressed_vocab_size=compressed_vocab_size,
+        use_compressed_ve=args.use_compressed_ve,
+        use_engrams=args.use_engrams,
+        use_compressed_engrams=args.use_compressed_engrams,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -148,7 +164,8 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
-model.compressed_vocab_lookup[:vocab_size].copy_(compressed_vocab_lookup) # load compressed vocab mapping for VE lookup
+if use_compressed:
+    model.compressed_vocab_lookup[:vocab_size].copy_(compressed_vocab_lookup) # load compressed vocab mapping
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
