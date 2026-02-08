@@ -26,13 +26,6 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
-    # Gated engram config keys (added when replacing BigramEmbed with GatedEngram)
-    if "engram_dim" not in model_config_kwargs:
-        model_config_kwargs["engram_dim"] = 0
-        log0(f"Patching missing engram_dim in model config to 0")
-    if "engram_layers" not in model_config_kwargs:
-        model_config_kwargs["engram_layers"] = ""
-        log0(f"Patching missing engram_layers in model config to ''")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
