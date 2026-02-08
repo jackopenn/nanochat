@@ -43,6 +43,8 @@ class GPTConfig:
     use_compressed_ve: bool = False      # use compressed tokenizer for value embedding lookup
     use_engrams: bool = False            # enable bigram hash embeddings blended into residual stream
     use_compressed_engrams: bool = False # use compressed tokenizer for engram hashing (smaller table, case-invariant bigrams)
+    engram_dim: int = 0                  # engram embedding bottleneck dimension (0 = auto: n_embd // 2)
+    engram_layers: str = ""              # comma-separated layer indices for engram injection (empty = auto: layers 1 and 2*n_layer//3)
 
 
 def norm(x):
@@ -50,39 +52,50 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-class BigramEmbed(nn.Module):
+class GatedEngram(nn.Module):
     """
-    Hash bigrams to embeddings. Simple, self-contained, runs on GPU.
-    Following modded-nanogpt's approach: single hash, no gating.
+    Context-aware gated bigram injection (engram).
 
-    For each position t, hashes (token[t-1], token[t]) to an index in a large
-    embedding table. This provides O(1) lookup for local 2-gram patterns,
-    offloading static pattern reconstruction from the transformer layers.
+    Hashes (prev_token, curr_token) into a bottleneck embedding table, then
+    uses the current hidden state to gate how much engram signal to blend in.
+    The gate is a sigmoid dot-product attention: α = σ(norm(h) · norm(W_k·e) / √d).
 
-    Ref: https://github.com/KellerJordan/modded-nanogpt/pull/201
+    Shared across injection layers (weight-tied), so no per-layer parameter cost.
+
+    Ref: https://arxiv.org/abs/2601.07372 (Conditional Memory via Scalable Lookup)
     Ref: https://arxiv.org/abs/1709.03933 (Hash Embeddings)
     """
-    def __init__(self, vocab_size: int, embed_dim: int, table_multiplier: int = 5):
+    def __init__(self, vocab_size: int, n_embd: int, engram_dim: int, table_multiplier: int = 5):
         super().__init__()
         self.bigram_vocab_size = vocab_size * table_multiplier
-        self.embed = nn.Embedding(self.bigram_vocab_size, embed_dim)
+        self.embed = nn.Embedding(self.bigram_vocab_size, engram_dim)
+        self.w_k = nn.Linear(engram_dim, n_embd, bias=False)
+        self.w_v = nn.Linear(engram_dim, n_embd, bias=False)
+        self.scale = n_embd ** -0.5
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        """
-        idx: (B, T) token ids
-        Returns: (B, T, embed_dim) bigram embeddings
-        """
-        # Hash (prev_token, curr_token) -> index
-        # Position 0 gets a reserved index (no valid bigram)
+    def hash_bigrams(self, idx: torch.Tensor) -> torch.Tensor:
+        """Hash (prev_token, curr_token) -> index. Position 0 gets a reserved index."""
         rand_int_1 = 36313
         rand_int_2 = 27191
         mod = self.bigram_vocab_size - 1
-
         h = torch.empty_like(idx, dtype=torch.long)
         h[:, 0] = mod  # reserved index for position 0
         h[:, 1:] = (rand_int_1 * idx[:, 1:] ^ rand_int_2 * idx[:, :-1]) % mod
+        return h
 
-        return self.embed(h)
+    def forward(self, engram_idx: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        """
+        engram_idx: (B, T) pre-computed bigram hash indices
+        h: (B, T, n_embd) current hidden state at this layer
+        Returns: (B, T, n_embd) gated engram contribution
+        """
+        e = self.embed(engram_idx)                                          # (B, T, engram_dim)
+        k = self.w_k(e)                                                     # (B, T, n_embd)
+        v = self.w_v(e)                                                     # (B, T, n_embd)
+        q = norm(h)                                                         # RMSNorm of hidden state
+        k_normed = norm(k)
+        alpha = torch.sigmoid((q * k_normed).sum(-1, keepdim=True) * self.scale)  # (B, T, 1)
+        return alpha * v
 
 
 def has_ve(layer_idx, n_layer):
@@ -212,11 +225,16 @@ class GPT(nn.Module):
         # Separate parameters so they can have different optimizer treatment
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))   # fake init, real init in init_weights()
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))     # fake init, real init in init_weights()
-        # Bigram hash embeddings (engrams): O(1) lookup for local 2-gram patterns
+        # Gated engram (context-aware bigram injection): shared module injected at specific layers
         if config.use_engrams:
-            self.bigram_lambdas = nn.Parameter(torch.zeros(config.n_layer)) # fake init, real init in init_weights()
             engram_vocab = config.compressed_vocab_size if config.use_compressed_engrams else config.vocab_size
-            self.bigram_embed = BigramEmbed(engram_vocab, config.n_embd)
+            engram_dim = config.engram_dim if config.engram_dim > 0 else config.n_embd // 2
+            self.gated_engram = GatedEngram(engram_vocab, config.n_embd, engram_dim)
+            # Compute which layers get engram injection
+            if config.engram_layers:
+                self._engram_layer_set = frozenset(int(x) for x in config.engram_layers.split(","))
+            else:
+                self._engram_layer_set = frozenset({1, 2 * config.n_layer // 3})
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
@@ -272,10 +290,11 @@ class GPT(nn.Module):
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
         self.x0_lambdas.fill_(0.1)      # 0.1 => small initial weight for skip connection to input embedding
 
-        # Bigram embeddings: zero init so it starts as identity
+        # Gated engram: zero init so it starts as identity (no engram signal at init)
         if self.config.use_engrams:
-            self.bigram_lambdas.fill_(0.1)  # 0.1 => small initial weight for skip connection to bigram embeddings
-            nn.init.zeros_(self.bigram_embed.embed.weight)
+            nn.init.zeros_(self.gated_engram.embed.weight)
+            nn.init.zeros_(self.gated_engram.w_k.weight)
+            nn.init.zeros_(self.gated_engram.w_v.weight)
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
@@ -300,7 +319,7 @@ class GPT(nn.Module):
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
             if self.config.use_engrams:
-                self.bigram_embed.to(dtype=torch.bfloat16)
+                self.gated_engram.embed.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -366,10 +385,9 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        bigram_embed_numel = self.bigram_embed.embed.weight.numel() if self.config.use_engrams else 0
-        bigram_scalars = self.bigram_lambdas.numel() if self.config.use_engrams else 0
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel + bigram_embed_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel() + bigram_scalars)
+        engram_embed_numel = self.gated_engram.embed.weight.numel() if self.config.use_engrams else 0
+        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel + engram_embed_numel +
+                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -394,14 +412,12 @@ class GPT(nn.Module):
         """
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        bigram_embed = sum(p.numel() for p in self.bigram_embed.parameters()) if self.config.use_engrams else 0
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        if self.config.use_engrams:
-            scalars += self.bigram_lambdas.numel()
-        total = wte + bigram_embed + value_embeds + lm_head + transformer_matrices + scalars
+        engram_params = sum(p.numel() for p in self.gated_engram.parameters()) if self.config.use_engrams else 0
+        total = wte + engram_params + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         result = {
             'wte': wte,
@@ -412,7 +428,7 @@ class GPT(nn.Module):
             'total': total,
         }
         if self.config.use_engrams:
-            result['bigram_embed'] = bigram_embed
+            result['engram'] = engram_params
         return result
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
@@ -428,9 +444,9 @@ class GPT(nn.Module):
         x0_params = [self.x0_lambdas]
         all_params_count = len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
         if self.config.use_engrams:
-            bigram_embed_params = list(self.bigram_embed.parameters())
-            bigram_lambda_params = [self.bigram_lambdas]
-            all_params_count += len(bigram_embed_params) + len(bigram_lambda_params)
+            engram_embed_params = [self.gated_engram.embed.weight]
+            engram_proj_params = list(self.gated_engram.w_k.parameters()) + list(self.gated_engram.w_v.parameters())
+            all_params_count += len(engram_embed_params) + len(engram_proj_params)
         assert len(list(self.parameters())) == all_params_count
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
@@ -447,8 +463,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
         if self.config.use_engrams:
-            param_groups.append(dict(kind='adamw', params=bigram_embed_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
-            param_groups.append(dict(kind='adamw', params=bigram_lambda_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0))
+            param_groups.append(dict(kind='adamw', params=engram_embed_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+            param_groups.append(dict(kind='adamw', params=engram_proj_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -481,14 +497,14 @@ class GPT(nn.Module):
         # Compressed token ids (for VE and/or engrams, depending on config)
         compressed_idx = self.compressed_vocab_lookup[idx]
         ve_idx = compressed_idx if self.config.use_compressed_ve else idx
-        # Engram (bigram hash) embeddings
+        # Engram (bigram hash) indices — computed once, reused at each injection layer
         if self.config.use_engrams:
-            engram_idx = compressed_idx if self.config.use_compressed_engrams else idx
-            x0_bigram = self.bigram_embed(engram_idx)
+            engram_raw_idx = compressed_idx if self.config.use_compressed_engrams else idx
+            engram_idx = self.gated_engram.hash_bigrams(engram_raw_idx)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            if self.config.use_engrams:
-                x = x + self.bigram_lambdas[i] * x0_bigram
+            if self.config.use_engrams and i in self._engram_layer_set:
+                x = x + self.gated_engram(engram_idx, x)
             ve = self.value_embeds[str(i)](ve_idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)

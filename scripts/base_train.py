@@ -54,6 +54,8 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--use-compressed-ve", action="store_true", help="use compressed tokenizer for value embedding lookup (case/accent-invariant)")
 parser.add_argument("--use-engrams", action="store_true", help="enable bigram hash embeddings blended into residual stream")
 parser.add_argument("--use-compressed-engrams", action="store_true", help="use compressed tokenizer for engram hashing (implies --use-engrams)")
+parser.add_argument("--engram-dim", type=int, default=0, help="engram embedding bottleneck dimension (0 = auto: n_embd // 2)")
+parser.add_argument("--engram-layers", type=str, default="", help="comma-separated layer indices for engram injection (empty = auto: layers 1 and 2*n_layer//3)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -152,6 +154,8 @@ def build_model_meta(depth):
         use_compressed_ve=args.use_compressed_ve,
         use_engrams=args.use_engrams,
         use_compressed_engrams=args.use_compressed_engrams,
+        engram_dim=args.engram_dim,
+        engram_layers=args.engram_layers,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
