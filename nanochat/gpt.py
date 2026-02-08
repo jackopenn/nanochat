@@ -43,6 +43,7 @@ class GPTConfig:
     use_compressed_ve: bool = False      # use compressed tokenizer for value embedding lookup
     use_engrams: bool = False            # enable bigram hash embeddings blended into residual stream
     use_compressed_engrams: bool = False # use compressed tokenizer for engram hashing (smaller table, case-invariant bigrams)
+    engram_num_hashes: int = 2           # number of independent hash functions for bigram embeddings
 
 
 def norm(x):
@@ -62,27 +63,34 @@ class BigramEmbed(nn.Module):
     Ref: https://github.com/KellerJordan/modded-nanogpt/pull/201
     Ref: https://arxiv.org/abs/1709.03933 (Hash Embeddings)
     """
-    def __init__(self, vocab_size: int, embed_dim: int, table_multiplier: int = 5):
+    def __init__(self, vocab_size: int, embed_dim: int, num_hashes: int = 2, table_multiplier: int = 5):
         super().__init__()
         self.bigram_vocab_size = vocab_size * table_multiplier
+        self.num_hashes = num_hashes
         self.embed = nn.Embedding(self.bigram_vocab_size, embed_dim)
+        # K independent constant pairs for multi-hash embeddings
+        self.hash_constants = [
+            (36313, 27191),
+            (45389, 51593),
+            (59369, 68891),
+            (73721, 82139),
+        ][:num_hashes]
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         """
         idx: (B, T) token ids
-        Returns: (B, T, embed_dim) bigram embeddings
+        Returns: (B, T, embed_dim) bigram embeddings (sum of K independent hash lookups)
         """
-        # Hash (prev_token, curr_token) -> index
-        # Position 0 gets a reserved index (no valid bigram)
-        rand_int_1 = 36313
-        rand_int_2 = 27191
         mod = self.bigram_vocab_size - 1
-
-        h = torch.empty_like(idx, dtype=torch.long)
-        h[:, 0] = mod  # reserved index for position 0
-        h[:, 1:] = (rand_int_1 * idx[:, 1:] ^ rand_int_2 * idx[:, :-1]) % mod
-
-        return self.embed(h)
+        prev, curr = idx[:, :-1], idx[:, 1:]
+        out = None
+        for rand_int_1, rand_int_2 in self.hash_constants:
+            h = torch.empty_like(idx, dtype=torch.long)
+            h[:, 0] = mod  # reserved index for position 0
+            h[:, 1:] = (rand_int_1 * curr ^ rand_int_2 * prev) % mod
+            e = self.embed(h)
+            out = e if out is None else out + e
+        return out
 
 
 def has_ve(layer_idx, n_layer):
@@ -216,7 +224,7 @@ class GPT(nn.Module):
         if config.use_engrams:
             self.bigram_lambdas = nn.Parameter(torch.zeros(config.n_layer)) # fake init, real init in init_weights()
             engram_vocab = config.compressed_vocab_size if config.use_compressed_engrams else config.vocab_size
-            self.bigram_embed = BigramEmbed(engram_vocab, config.n_embd)
+            self.bigram_embed = BigramEmbed(engram_vocab, config.n_embd, num_hashes=config.engram_num_hashes)
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim

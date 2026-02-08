@@ -26,6 +26,10 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Old engram models used a single hash function
+    if "engram_num_hashes" not in model_config_kwargs:
+        model_config_kwargs["engram_num_hashes"] = 2
+        log0(f"Patching missing engram_num_hashes in model config to 2")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
