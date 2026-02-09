@@ -40,6 +40,7 @@ class GPTConfig:
     use_glu: bool = False
     activation: str = "relu2" # "relu2" or "swish"
     stem_pattern: str = ""  # STEM layer pattern: D=Dense, S=STEM. Empty=no STEM. e.g. "DDS"=every 3rd layer
+    stem_table_multiplier: int = 5  # hash table size = vocab_size * multiplier for bigram STEM embeddings
 
 
 def norm(x):
@@ -56,6 +57,20 @@ def is_stem(layer_idx, n_layer, stem_pattern):
     if not stem_pattern:
         return False
     return stem_pattern[layer_idx % len(stem_pattern)] == "S"
+
+class BigramEmbed(nn.Module):
+    """Bigram hash embedding: looks up based on (current_token, previous_token) pair via hashing."""
+    def __init__(self, vocab_size, embed_dim, table_multiplier=5):
+        super().__init__()
+        self.table_size = vocab_size * table_multiplier
+        self.embed = nn.Embedding(self.table_size, embed_dim)
+
+    def forward(self, idx):
+        padded = F.pad(idx, (1, 0), value=0)
+        prev = padded[:, :-1]
+        curr = idx
+        h = ((36313 * curr) ^ (27191 * prev)) % (self.table_size - 1)
+        return self.embed(h)
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
@@ -219,7 +234,7 @@ class GPT(nn.Module):
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
         # STEM embeddings: per-layer token-indexed embedding replacing the up-projection in STEM MLP layers
         stem_hidden_dim = ((int(8 * config.n_embd / 3) + 63) // 64) * 64
-        self.stem_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, stem_hidden_dim) for i in range(config.n_layer) if is_stem(i, config.n_layer, config.stem_pattern)})
+        self.stem_embeds = nn.ModuleDict({str(i): BigramEmbed(config.vocab_size, stem_hidden_dim, config.stem_table_multiplier) for i in range(config.n_layer) if is_stem(i, config.n_layer, config.stem_pattern)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -275,7 +290,7 @@ class GPT(nn.Module):
 
         # STEM embeddings (same init as other weights: uniform with std = 1/sqrt(n_embd))
         for se in self.stem_embeds.values():
-            torch.nn.init.uniform_(se.weight, -s, s)
+            torch.nn.init.uniform_(se.embed.weight, -s, s)
 
         # Gate weights init to zero so gates start at sigmoid(0) = 0.5, scaled by 2 -> 1.0 (neutral)
         for block in self.transformer.h:
@@ -359,7 +374,7 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        stem_embeds_numel = sum(se.weight.numel() for se in self.stem_embeds.values())
+        stem_embeds_numel = sum(se.embed.weight.numel() for se in self.stem_embeds.values())
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel + stem_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len

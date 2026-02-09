@@ -54,6 +54,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--use-glu", action="store_true", help="use GLU MLP variant (SwiGLU/ReluSquaredGLU) instead of standard MLP")
 parser.add_argument("--activation", type=str, default="relu2", choices=["relu2", "swish"], help="MLP activation function: relu2 (relu squared) or swish")
 parser.add_argument("--stem-pattern", type=str, default="", help="STEM layer pattern: D=Dense, S=STEM. Empty=no STEM. e.g. 'DDS'=every 3rd layer")
+parser.add_argument("--stem-table-multiplier", type=int, default=5, help="hash table size multiplier for bigram STEM embeddings (table_size = vocab_size * multiplier)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -136,7 +137,7 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern, use_glu=args.use_glu, activation=args.activation,
-        stem_pattern=args.stem_pattern,
+        stem_pattern=args.stem_pattern, stem_table_multiplier=args.stem_table_multiplier,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
