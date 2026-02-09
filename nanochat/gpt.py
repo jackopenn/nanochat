@@ -4,7 +4,7 @@ Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
 - untied weights for token embedding and lm_head
-- relu^2 activation in MLP
+- relu^2 / swish activation in MLP (with optional GLU gating)
 - norm after token embedding
 - no learnable params in rmsnorm
 - no bias in linear layers
@@ -37,6 +37,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    use_glu: bool = False
+    activation: str = "relu2" # "relu2" or "swish"
 
 
 def norm(x):
@@ -121,12 +123,35 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.use_glu = config.use_glu
+        self.activation = config.activation
+        if self.use_glu:
+            # GLU: two projections up (one for value, one for gate), sized to match param count
+            # Standard MLP has 2 * (d * 4d) = 8d^2 params. GLU with hidden_dim h has 3 * (d * h).
+            # Match params: h = 8d/3, round to nearest multiple of 64 for efficiency.
+            hidden_dim = int(8 * config.n_embd / 3)
+            hidden_dim = ((hidden_dim + 63) // 64) * 64
+            self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_gate = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        else:
+            self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        if self.use_glu:
+            v = self.c_fc(x)
+            gate = self.c_gate(x)
+            if self.activation == "swish":
+                x = v * F.silu(gate)
+            else: # relu2
+                x = v * F.relu(gate).square()
+        else:
+            x = self.c_fc(x)
+            if self.activation == "swish":
+                x = F.silu(x)
+            else: # relu2
+                x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -198,6 +223,7 @@ class GPT(nn.Module):
             attn.c_v:        uniform, std=1/sqrt(n_embd)
             attn.c_proj:     zeros
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
+            mlp.c_gate:      uniform, std=1/sqrt(n_embd) (GLU only)
             mlp.c_proj:      zeros
         """
 
@@ -214,6 +240,8 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            if block.mlp.use_glu:
+                torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
