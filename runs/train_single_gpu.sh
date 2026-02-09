@@ -18,5 +18,5 @@ fi
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining) on a single GPU
-python -m scripts.base_train --depth=12 --device-batch-size=64 --run=$WANDB_RUN
+python -m scripts.base_train --depth=12 --device-batch-size=64 --core-metric-every=9999 --run=$WANDB_RUN
 
