@@ -398,6 +398,14 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # Go!
+prof = torch.profiler.profile(
+    activities=[torch.profiler.ProfilerActivity.CPU]
+               + ([torch.profiler.ProfilerActivity.CUDA] if device_type == "cuda" else []),
+    schedule=torch.profiler.schedule(wait=10, warmup=0, active=10, repeat=1),
+    record_shapes=True,
+    with_stack=True,
+)
+prof.start()
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
@@ -553,6 +561,12 @@ while True:
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
+    prof.step()
+    if step == 21:
+        prof.stop()
+        trace_path = f"profile_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        prof.export_chrome_trace(trace_path)
+        print0(f"Exported profiler trace to {trace_path}")
 
     # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
     # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
