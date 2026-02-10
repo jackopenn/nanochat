@@ -220,6 +220,7 @@ class GPT(nn.Module):
         # STEM embeddings: per-layer token-indexed embedding replacing the up-projection in STEM MLP layers
         stem_hidden_dim = ((int(8 * config.n_embd / 3) + 63) // 64) * 64
         self.stem_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, stem_hidden_dim) for i in range(config.n_layer) if is_stem(i, config.n_layer, config.stem_pattern)})
+        self.prefetch_embeds = True  # prefetch all VE/SE gathers before the block loop
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -458,12 +459,20 @@ class GPT(nn.Module):
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx) # embed current token
+        if self.prefetch_embeds:
+            # Prefetch all embedding lookups before the loop so gathers overlap with wte+norm compute
+            ve_cache = {k: ve(idx) for k, ve in self.value_embeds.items()}
+            se_cache = {k: se(idx) for k, se in self.stem_embeds.items()}
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            se = self.stem_embeds[str(i)](idx) if str(i) in self.stem_embeds else None
+            if self.prefetch_embeds:
+                ve = ve_cache.get(str(i))
+                se = se_cache.get(str(i))
+            else:
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                se = self.stem_embeds[str(i)](idx) if str(i) in self.stem_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, stem_embed=se)
         x = norm(x)
 

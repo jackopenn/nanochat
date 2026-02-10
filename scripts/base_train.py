@@ -54,6 +54,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--use-glu", action="store_true", help="use GLU MLP variant (SwiGLU/ReluSquaredGLU) instead of standard MLP")
 parser.add_argument("--activation", type=str, default="relu2", choices=["relu2", "swish"], help="MLP activation function: relu2 (relu squared) or swish")
 parser.add_argument("--stem-pattern", type=str, default="", help="STEM layer pattern: D=Dense, S=STEM. Empty=no STEM. e.g. 'DDS'=every 3rd layer")
+parser.add_argument("--no-prefetch-embeds", action="store_true", help="disable prefetching VE/SE embeddings before the block loop (for benchmarking)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -149,6 +150,7 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
+model.prefetch_embeds = not args.no_prefetch_embeds
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
