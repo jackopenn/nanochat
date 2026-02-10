@@ -4,7 +4,7 @@ Notable features:
 - rotary embeddings (and no positional embeddings)
 - QK norm
 - untied weights for token embedding and lm_head
-- relu^2 activation in MLP
+- relu^2 / swish activation in MLP (with optional GLU gating)
 - norm after token embedding
 - no learnable params in rmsnorm
 - no bias in linear layers
@@ -37,6 +37,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    use_glu: bool = False
+    activation: str = "relu2" # "relu2" or "swish"
+    stem_pattern: str = ""  # STEM layer pattern: D=Dense, S=STEM. Empty=no STEM. e.g. "DDS"=every 3rd layer
 
 
 def norm(x):
@@ -47,6 +50,12 @@ def norm(x):
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+def is_stem(layer_idx, n_layer, stem_pattern):
+    """Returns True if this layer's MLP should use STEM (embedding lookup instead of up-projection)."""
+    if not stem_pattern:
+        return False
+    return stem_pattern[layer_idx % len(stem_pattern)] == "S"
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
@@ -119,14 +128,47 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, is_stem=False):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.use_glu = config.use_glu
+        self.activation = config.activation
+        self.is_stem = is_stem
+        if self.use_glu or self.is_stem:
+            # GLU: two projections up (one for value, one for gate), sized to match param count
+            # Standard MLP has 2 * (d * 4d) = 8d^2 params. GLU with hidden_dim h has 3 * (d * h).
+            # Match params: h = 8d/3, round to nearest multiple of 64 for efficiency.
+            # STEM layers use the same hidden_dim but replace c_fc with an embedding lookup.
+            hidden_dim = int(8 * config.n_embd / 3)
+            hidden_dim = ((hidden_dim + 63) // 64) * 64
+            if not self.is_stem:
+                self.c_fc = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_gate = nn.Linear(config.n_embd, hidden_dim, bias=False)
+            self.c_proj = nn.Linear(hidden_dim, config.n_embd, bias=False)
+        else:
+            self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+    def forward(self, x, stem_embed=None):
+        if self.is_stem:
+            # STEM: use embedding lookup instead of c_fc up-projection
+            gate = self.c_gate(x)
+            if self.activation == "swish":
+                x = stem_embed * F.silu(gate)
+            else: # relu2
+                x = stem_embed * F.relu(gate).square()
+        elif self.use_glu:
+            v = self.c_fc(x)
+            gate = self.c_gate(x)
+            if self.activation == "swish":
+                x = v * F.silu(gate)
+            else: # relu2
+                x = v * F.relu(gate).square()
+        else:
+            x = self.c_fc(x)
+            if self.activation == "swish":
+                x = F.silu(x)
+            else: # relu2
+                x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -135,11 +177,11 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, is_stem=is_stem(layer_idx, config.n_layer, config.stem_pattern))
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, stem_embed=None):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        x = x + self.mlp(norm(x), stem_embed=stem_embed)
         return x
 
 
@@ -175,6 +217,10 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # STEM embeddings: per-layer token-indexed embedding replacing the up-projection in STEM MLP layers
+        stem_hidden_dim = ((int(8 * config.n_embd / 3) + 63) // 64) * 64
+        self.stem_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, stem_hidden_dim) for i in range(config.n_layer) if is_stem(i, config.n_layer, config.stem_pattern)})
+        self.prefetch_embeds = True  # prefetch all VE/SE gathers before the block loop
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -198,6 +244,7 @@ class GPT(nn.Module):
             attn.c_v:        uniform, std=1/sqrt(n_embd)
             attn.c_proj:     zeros
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
+            mlp.c_gate:      uniform, std=1/sqrt(n_embd) (GLU only)
             mlp.c_proj:      zeros
         """
 
@@ -213,7 +260,10 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            if not block.mlp.is_stem:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            if block.mlp.use_glu or block.mlp.is_stem:
+                torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
@@ -223,6 +273,10 @@ class GPT(nn.Module):
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
+
+        # STEM embeddings (same init as other weights: uniform with std = 1/sqrt(n_embd))
+        for se in self.stem_embeds.values():
+            torch.nn.init.uniform_(se.weight, -s, s)
 
         # Gate weights init to zero so gates start at sigmoid(0) = 0.5, scaled by 2 -> 1.0 (neutral)
         for block in self.transformer.h:
@@ -239,6 +293,8 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=torch.bfloat16)
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
+            for se in self.stem_embeds.values():
+                se.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -304,7 +360,8 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+        stem_embeds_numel = sum(se.weight.numel() for se in self.stem_embeds.values())
+        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel + stem_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
@@ -331,14 +388,16 @@ class GPT(nn.Module):
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        stem_embeds = sum(p.numel() for p in self.stem_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + stem_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
+            'stem_embeds': stem_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
@@ -352,11 +411,12 @@ class GPT(nn.Module):
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
+        stem_embeds_params = list(self.stem_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(stem_embeds_params) + len(resid_params) + len(x0_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -368,6 +428,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=stem_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
@@ -398,12 +459,21 @@ class GPT(nn.Module):
 
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx) # embed current token
+        if self.prefetch_embeds:
+            # Prefetch all embedding lookups before the loop so gathers overlap with wte+norm compute
+            ve_cache = {k: ve(idx) for k, ve in self.value_embeds.items()}
+            se_cache = {k: se(idx) for k, se in self.stem_embeds.items()}
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if self.prefetch_embeds:
+                ve = ve_cache.get(str(i))
+                se = se_cache.get(str(i))
+            else:
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                se = self.stem_embeds[str(i)](idx) if str(i) in self.stem_embeds else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, stem_embed=se)
         x = norm(x)
 
         # Forward the lm_head (compute logits)

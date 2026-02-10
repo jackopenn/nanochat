@@ -51,6 +51,10 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--use-glu", action="store_true", help="use GLU MLP variant (SwiGLU/ReluSquaredGLU) instead of standard MLP")
+parser.add_argument("--activation", type=str, default="relu2", choices=["relu2", "swish"], help="MLP activation function: relu2 (relu squared) or swish")
+parser.add_argument("--stem-pattern", type=str, default="", help="STEM layer pattern: D=Dense, S=STEM. Empty=no STEM. e.g. 'DDS'=every 3rd layer")
+parser.add_argument("--no-prefetch-embeds", action="store_true", help="disable prefetching VE/SE embeddings before the block loop (for benchmarking)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -132,7 +136,8 @@ def build_model_meta(depth):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
+        window_pattern=args.window_pattern, use_glu=args.use_glu, activation=args.activation,
+        stem_pattern=args.stem_pattern,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -145,6 +150,7 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
+model.prefetch_embeds = not args.no_prefetch_embeds
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -392,6 +398,15 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
 # Go!
+prof = torch.profiler.profile(
+    activities=[torch.profiler.ProfilerActivity.CPU]
+               + ([torch.profiler.ProfilerActivity.CUDA] if device_type == "cuda" else []),
+    schedule=torch.profiler.schedule(wait=10, warmup=10, active=2, repeat=1),
+    record_shapes=True,
+    with_stack=True,
+    with_modules=True
+)
+prof.start()
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
@@ -547,6 +562,13 @@ while True:
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
+    prof.step()
+    if step == 33:
+        prof.stop()
+        trace_path = f"profile_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        prof.export_chrome_trace(trace_path)
+        print0(f"Exported profiler trace to {trace_path}")
+        wandb_run.log_artifact(trace_path)
 
     # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
     # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
