@@ -198,6 +198,8 @@ class DummyWandb:
         pass
     def log(self, *args, **kwargs):
         pass
+    def log_artifact(self, *args, **kwargs):
+        pass
     def finish(self):
         pass
 

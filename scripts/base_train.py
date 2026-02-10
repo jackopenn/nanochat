@@ -401,9 +401,10 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 prof = torch.profiler.profile(
     activities=[torch.profiler.ProfilerActivity.CPU]
                + ([torch.profiler.ProfilerActivity.CUDA] if device_type == "cuda" else []),
-    schedule=torch.profiler.schedule(wait=10, warmup=0, active=10, repeat=1),
+    schedule=torch.profiler.schedule(wait=10, warmup=10, active=2, repeat=1),
     record_shapes=True,
     with_stack=True,
+    with_modules=True
 )
 prof.start()
 while True:
@@ -562,11 +563,12 @@ while True:
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
     prof.step()
-    if step == 21:
+    if step == 33:
         prof.stop()
         trace_path = f"profile_{time.strftime('%Y%m%d_%H%M%S')}.json"
         prof.export_chrome_trace(trace_path)
         print0(f"Exported profiler trace to {trace_path}")
+        wandb_run.log_artifact(trace_path)
 
     # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
     # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
