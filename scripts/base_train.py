@@ -18,6 +18,8 @@ import json
 import time
 import math
 import argparse
+import hashlib
+import re
 from dataclasses import asdict
 from contextlib import nullcontext, contextmanager
 
@@ -74,7 +76,7 @@ parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bp
 parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number of tokens to evaluate val loss on")
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
-parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--sample-every", type=int, default=100, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
@@ -150,6 +152,9 @@ model.init_weights() # 3) All tensors get initialized
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+sample_output_dir = os.path.join(checkpoint_dir, "samples")
+if master_process:
+    os.makedirs(sample_output_dir, exist_ok=True)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
@@ -367,6 +372,13 @@ def get_weight_decay(it):
 # -----------------------------------------------------------------------------
 # Training loop
 
+def prompt_to_sample_filename(prompt: str) -> str:
+    prompt_label = prompt.strip() or "empty_prompt"
+    prompt_slug = re.sub(r"[^a-z0-9]+", "_", prompt_label.lower()).strip("_")
+    prompt_slug = prompt_slug[:64] or "prompt"
+    prompt_hash = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
+    return f"{prompt_slug}_{prompt_hash}.txt"
+
 # Loop state (variables updated by the training loop)
 if not resuming:
     step = 0
@@ -381,7 +393,7 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
-
+t
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
@@ -433,23 +445,34 @@ while True:
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+    if args.sample_every > 0 and master_process and (last_step or step == 0 or (step > 0 and step % args.sample_every == 0)):
         model.eval()
         prompts = [
             "The capital of France is",
-            "The chemical symbol of gold is",
-            "If yesterday was Friday, then tomorrow will be",
-            "The opposite of hot is",
-            "The planets of the solar system are:",
-            "My favorite color is",
-            "If 5*x + 3 = 13, then x is",
+            "The meaning of life is",
+            "",
+            # "The chemical symbol of gold is",
+            # "If yesterday was Friday, then tomorrow will be",
+            # "The opposite of hot is",
+            # "The planets of the solar system are:",
+            # "My favorite color is",
+            # "If 5*x + 3 = 13, then x is",
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
+            sample_path = os.path.join(sample_output_dir, prompt_to_sample_filename(prompt))
             with disable_fp8(orig_model), autocast_ctx:
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+                sample_sequences, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=64, temperature=0)
+            for sample_tokens in sample_sequences:
+                completion_tokens = sample_tokens[len(tokens):]
+                completion = tokenizer.decode(completion_tokens)
+                completion_oneline = completion.replace("\n", "\\n")
+                sample_line = f"{prompt}\t{completion_oneline}"
+                print0(sample_line)
+                with open(sample_path, "a", encoding="utf-8") as f:
+                    f.write(sample_line)
+                    f.write("\n")
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
