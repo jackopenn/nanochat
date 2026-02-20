@@ -18,6 +18,7 @@ import json
 import time
 import math
 import argparse
+import glob
 import hashlib
 import re
 from dataclasses import asdict
@@ -155,6 +156,8 @@ checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 sample_output_dir = os.path.join(checkpoint_dir, "samples")
 if master_process:
     os.makedirs(sample_output_dir, exist_ok=True)
+sample_artifact_name = f"{output_dirname}-samples"
+checkpoint_artifact_name = f"{output_dirname}-checkpoints"
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
@@ -379,6 +382,15 @@ def prompt_to_sample_filename(prompt: str) -> str:
     prompt_hash = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:10]
     return f"{prompt_slug}_{prompt_hash}.txt"
 
+def checkpoint_files_for_step(checkpoint_dir: str, step: int) -> list[str]:
+    step_tag = f"{step:06d}"
+    files = [
+        os.path.join(checkpoint_dir, f"model_{step_tag}.pt"),
+        os.path.join(checkpoint_dir, f"meta_{step_tag}.json"),
+    ]
+    files.extend(sorted(glob.glob(os.path.join(checkpoint_dir, f"optim_{step_tag}_rank*.pt"))))
+    return [path for path in files if os.path.exists(path)]
+
 # Loop state (variables updated by the training loop)
 if not resuming:
     step = 0
@@ -393,7 +405,6 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
-t
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
@@ -459,6 +470,7 @@ while True:
             # "If 5*x + 3 = 13, then x is",
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        sample_rows = []
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             sample_path = os.path.join(sample_output_dir, prompt_to_sample_filename(prompt))
@@ -473,6 +485,14 @@ while True:
                 with open(sample_path, "a", encoding="utf-8") as f:
                     f.write(sample_line)
                     f.write("\n")
+                sample_rows.append([step, prompt, completion, sample_path])
+        if not use_dummy_wandb and sample_rows:
+            wandb_run.log({
+                "samples/table": wandb.Table(
+                    columns=["step", "prompt", "completion", "file"],
+                    data=sample_rows,
+                ),
+            }, step=step)
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
@@ -498,6 +518,31 @@ while True:
             },
             rank=ddp_rank,
         )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        if master_process and not use_dummy_wandb:
+            checkpoint_files = checkpoint_files_for_step(checkpoint_dir, step)
+            if checkpoint_files:
+                checkpoint_artifact = wandb.Artifact(
+                    name=checkpoint_artifact_name,
+                    type="checkpoint",
+                    metadata={"step": step, "num_files": len(checkpoint_files)},
+                )
+                for file_path in checkpoint_files:
+                    checkpoint_artifact.add_file(file_path, name=os.path.basename(file_path))
+                wandb_run.log_artifact(checkpoint_artifact)
+                wandb_run.log({
+                    "checkpoint/step": step,
+                    "checkpoint/num_files": len(checkpoint_files),
+                }, step=step)
+        if master_process and not use_dummy_wandb:
+            samples_artifact = wandb.Artifact(
+                name=sample_artifact_name,
+                type="samples",
+                metadata={"step": step},
+            )
+            samples_artifact.add_dir(sample_output_dir)
+            wandb_run.log_artifact(samples_artifact)
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
