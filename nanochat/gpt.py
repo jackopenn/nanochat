@@ -126,7 +126,7 @@ class CausalSelfAttention(nn.Module):
         # At init (query=0), softmax gives uniform 1/H, so n_head * 1/H = 1.0 per head (exact standard MHA)
         if head_attn_query is not None:
             head_keys = F.rms_norm(y, (y.size(-1),))
-            scores = torch.einsum('bthd,d->bth', head_keys, head_attn_query)
+            scores = torch.einsum('bthd,d->bth', head_keys, head_attn_query.to(y.dtype))
             alpha = F.softmax(scores, dim=-1)
             y = y * (self.n_head * alpha.unsqueeze(-1))
 
