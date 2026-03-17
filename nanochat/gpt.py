@@ -478,44 +478,20 @@ class GPT(nn.Module):
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
+        # Forward the lm_head (compute logits)
+        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
+        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+        logits = logits[..., :self.config.vocab_size] # slice to remove padding
+        logits = logits.float() # switch to fp32 for logit softcap and loss computation
+        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+
         if targets is not None:
-            # Chunked cross-entropy: compute loss in chunks along T to avoid materializing full (B, T, V) logits tensor.
-            # This saves ~4GB for d26 (B=16, T=2048, V=32K), enabling larger device batch sizes.
-            softcap = 15
-            vocab_size = self.config.vocab_size
-            chunk_size = 256
-            if loss_reduction == 'none':
-                losses = torch.zeros(B, T, device=x.device, dtype=torch.float32)
-                for i in range(0, T, chunk_size):
-                    chunk_logits = self.lm_head(x[:, i:i+chunk_size])
-                    chunk_logits = chunk_logits[..., :vocab_size].float()
-                    chunk_logits = softcap * torch.tanh(chunk_logits / softcap)
-                    chunk_targets = targets[:, i:i+chunk_size]
-                    chunk_loss = F.cross_entropy(
-                        chunk_logits.view(-1, vocab_size), chunk_targets.view(-1),
-                        ignore_index=-1, reduction='none'
-                    )
-                    losses[:, i:i+chunk_size] = chunk_loss.view(B, -1)
-                return losses
-            else:
-                total_loss = torch.zeros(1, device=x.device, dtype=torch.float32)
-                for i in range(0, T, chunk_size):
-                    chunk_logits = self.lm_head(x[:, i:i+chunk_size])
-                    chunk_logits = chunk_logits[..., :vocab_size].float()
-                    chunk_logits = softcap * torch.tanh(chunk_logits / softcap)
-                    chunk_targets = targets[:, i:i+chunk_size]
-                    total_loss = total_loss + F.cross_entropy(
-                        chunk_logits.view(-1, vocab_size), chunk_targets.view(-1),
-                        ignore_index=-1, reduction='sum'
-                    )
-                return total_loss / (B * T)
+            # training: given the targets, compute and return the loss
+            # TODO experiment with chunked cross-entropy?
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            return loss
         else:
-            # inference: compute full logits
-            softcap = 15
-            logits = self.lm_head(x)
-            logits = logits[..., :self.config.vocab_size]
-            logits = logits.float()
-            logits = softcap * torch.tanh(logits / softcap)
+            # inference: just return the logits directly
             return logits
 
     @torch.inference_mode()
