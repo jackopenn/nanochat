@@ -37,6 +37,7 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    head_attn: bool = True  # input-dependent head weighting (AttnRes for heads)
 
 
 def norm(x):
@@ -73,7 +74,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, head_attn_query):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -112,6 +113,14 @@ class CausalSelfAttention(nn.Module):
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
+        # Head-wise attention: input-dependent head weighting (AttnRes for heads)
+        # At init (query=0), softmax gives uniform 1/H, so n_head * 1/H = 1.0 per head (exact standard MHA)
+        if head_attn_query is not None:
+            head_keys = F.rms_norm(y, (y.size(-1),))
+            scores = torch.einsum('bthd,d->bth', head_keys, head_attn_query)
+            alpha = F.softmax(scores, dim=-1)
+            y = y * (self.n_head * alpha.unsqueeze(-1))
+
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
@@ -137,8 +146,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, head_attn_query):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, head_attn_query)
         x = x + self.mlp(norm(x))
         return x
 
@@ -175,6 +184,8 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # Head-wise attention: per-layer query vectors for input-dependent head weighting (AttnRes for heads)
+        self.head_attn_queries = nn.Parameter(torch.zeros(config.n_layer, head_dim)) if config.head_attn else None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -229,6 +240,10 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
+        # Head-wise attention queries init to zero (gives uniform 1/H via softmax => neutral at init)
+        if self.head_attn_queries is not None:
+            self.head_attn_queries.zero_()
+
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -240,8 +255,7 @@ class GPT(nn.Module):
             for ve in self.value_embeds.values():
                 ve.to(dtype=torch.bfloat16)
 
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        # TODO: bump base theta more? e.g. 100K is more common more recently
+    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # autodetect the device from model embeddings
         if device is None:
             device = self.transformer.wte.weight.device
@@ -304,8 +318,10 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        head_attn_numel = self.head_attn_queries.numel() if self.head_attn_queries is not None else 0
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+                          self.resid_lambdas.numel() + self.x0_lambdas.numel() +
+                          head_attn_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -333,7 +349,7 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + (self.head_attn_queries.numel() if self.head_attn_queries is not None else 0)
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -356,7 +372,8 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        head_attn_query_params = [self.head_attn_queries] if self.head_attn_queries is not None else []
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(head_attn_query_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -370,6 +387,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
+            *([dict(kind='adamw', params=head_attn_query_params, lr=scalar_lr * 0.1, betas=adam_betas, eps=1e-10, weight_decay=0.0)] if head_attn_query_params else []),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
@@ -403,23 +421,48 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            head_attn_query = self.head_attn_queries[i] if self.head_attn_queries is not None else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, head_attn_query)
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
-
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
+            # Chunked cross-entropy: compute loss in chunks along T to avoid materializing full (B, T, V) logits tensor.
+            # This saves ~4GB for d26 (B=16, T=2048, V=32K), enabling larger device batch sizes.
+            softcap = 15
+            vocab_size = self.config.vocab_size
+            chunk_size = 256
+            if loss_reduction == 'none':
+                losses = torch.zeros(B, T, device=x.device, dtype=torch.float32)
+                for i in range(0, T, chunk_size):
+                    chunk_logits = self.lm_head(x[:, i:i+chunk_size])
+                    chunk_logits = chunk_logits[..., :vocab_size].float()
+                    chunk_logits = softcap * torch.tanh(chunk_logits / softcap)
+                    chunk_targets = targets[:, i:i+chunk_size]
+                    chunk_loss = F.cross_entropy(
+                        chunk_logits.view(-1, vocab_size), chunk_targets.view(-1),
+                        ignore_index=-1, reduction='none'
+                    )
+                    losses[:, i:i+chunk_size] = chunk_loss.view(B, -1)
+                return losses
+            else:
+                total_loss = torch.zeros(1, device=x.device, dtype=torch.float32)
+                for i in range(0, T, chunk_size):
+                    chunk_logits = self.lm_head(x[:, i:i+chunk_size])
+                    chunk_logits = chunk_logits[..., :vocab_size].float()
+                    chunk_logits = softcap * torch.tanh(chunk_logits / softcap)
+                    chunk_targets = targets[:, i:i+chunk_size]
+                    total_loss = total_loss + F.cross_entropy(
+                        chunk_logits.view(-1, vocab_size), chunk_targets.view(-1),
+                        ignore_index=-1, reduction='sum'
+                    )
+                return total_loss / (B * T)
         else:
-            # inference: just return the logits directly
+            # inference: compute full logits
+            softcap = 15
+            logits = self.lm_head(x)
+            logits = logits[..., :self.config.vocab_size]
+            logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
             return logits
 
     @torch.inference_mode()
