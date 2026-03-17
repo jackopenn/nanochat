@@ -37,7 +37,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    head_attn: bool = True  # input-dependent head weighting (AttnRes for heads)
+    head_attn: bool = False  # input-dependent head weighting (AttnRes for heads)
+    parallel_block: bool = False  # parallel attention+MLP (PaLM-style) instead of sequential
 
 
 def norm(x):
@@ -153,10 +154,15 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.parallel = config.parallel_block
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, head_attn_query):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, head_attn_query)
-        x = x + self.mlp(norm(x))
+        if self.parallel:
+            nx = norm(x)
+            x = x + self.attn(nx, ve, cos_sin, window_size, kv_cache, head_attn_query) + self.mlp(nx)
+        else:
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, head_attn_query)
+            x = x + self.mlp(norm(x))
         return x
 
 
