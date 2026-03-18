@@ -280,6 +280,74 @@ class MuonAdamW(torch.optim.Optimizer):
         # Copy back to original params
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
+    def _step_head_muon(self, group: dict) -> None:
+        """
+        Per-head Muon update: reshape attention weights to per-head form before
+        orthogonalization, then reshape back. This avoids spurious cross-head
+        constraints from orthogonalizing the full (n_embd, n_embd) matrix.
+        """
+        params: list[Tensor] = group['params']
+        if not params:
+            return
+
+        head_dim = group['head_dim']
+        reshape = group['reshape']  # 'qkv' or 'proj'
+        n_embd = params[0].shape[-1] if reshape == 'qkv' else params[0].shape[0]
+
+        # Compute per-param head counts and reshape grads+params to per-head form
+        if reshape == 'qkv':
+            # qkv: (out, n_embd) -> view as (n_heads, head_dim, n_embd) — free reshape
+            heads_per_param = [p.shape[0] // head_dim for p in params]
+            cat_grads = torch.cat([p.grad.view(-1, head_dim, n_embd) for p in params])
+            cat_params = torch.cat([p.data.view(-1, head_dim, n_embd) for p in params])
+        else:
+            # proj: (n_embd, out) -> view as (n_embd, n_heads, head_dim) -> permute to (n_heads, n_embd, head_dim)
+            heads_per_param = [p.shape[1] // head_dim for p in params]
+            cat_grads = torch.cat([p.grad.view(n_embd, -1, head_dim).permute(1, 0, 2).contiguous() for p in params])
+            cat_params = torch.cat([p.data.view(n_embd, -1, head_dim).permute(1, 0, 2).contiguous() for p in params])
+
+        total_heads = cat_grads.shape[0]
+        head_shape = cat_grads.shape[1:]  # (head_dim, n_embd) or (n_embd, head_dim)
+
+        # Get or create group-level buffers (stored in first param's state)
+        state = self.state[params[0]]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(cat_grads)
+        if "second_momentum_buffer" not in state:
+            m, n = head_shape
+            smb_shape = (total_heads, m, 1) if m >= n else (total_heads, 1, n)
+            state["second_momentum_buffer"] = torch.zeros(smb_shape, dtype=cat_grads.dtype, device=cat_grads.device)
+
+        momentum_buffer = state["momentum_buffer"]
+        second_momentum_buffer = state["second_momentum_buffer"]
+        m, n = head_shape
+        red_dim = -1 if m >= n else -2
+
+        # Fill 0-D tensors — LR scaling uses per-head shape
+        self._muon_momentum_t.fill_(group["momentum"])
+        self._muon_beta2_t.fill_(group["beta2"])
+        self._muon_lr_t.fill_(group["lr"] * max(1.0, m / n) ** 0.5)
+        self._muon_wd_t.fill_(group["weight_decay"])
+
+        # Fused Muon step on per-head tensors
+        muon_step_fused(
+            cat_grads, cat_params,
+            momentum_buffer, second_momentum_buffer,
+            self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+            group["ns_steps"], red_dim,
+        )
+
+        # Copy back: slice updated tensor per-param, reshape to original shape
+        offset = 0
+        for p, nh in zip(params, heads_per_param):
+            chunk = cat_params[offset:offset + nh]
+            if reshape == 'qkv':
+                p.data.copy_(chunk.reshape(p.shape))
+            else:
+                # (nh, n_embd, head_dim) -> permute to (n_embd, nh, head_dim) -> reshape
+                p.data.copy_(chunk.permute(1, 0, 2).contiguous().reshape(p.shape))
+            offset += nh
+
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
@@ -287,6 +355,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_adamw(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
+            elif group['kind'] == 'head_muon':
+                self._step_head_muon(group)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
@@ -496,6 +566,20 @@ class DistMuonAdamW(torch.optim.Optimizer):
         future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
+    def _reduce_head_muon(self, group: dict, world_size: int) -> dict:
+        """Launch async all_reduce for head_muon group (simple all_reduce, same as circuit_pair)."""
+        futures = []
+        for p in group['params']:
+            future = dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+            futures.append(future)
+        return dict(futures=futures)
+
+    def _compute_head_muon(self, group: dict, info: dict) -> None:
+        """Wait for reduces, compute per-head Muon update (runs on every rank)."""
+        for future in info['futures']:
+            future.wait()
+        MuonAdamW._step_head_muon(self, group)
+
     def _finish_gathers(self, gather_list: list) -> None:
         """Wait for all gathers and copy Muon params back."""
         for info in gather_list:
@@ -516,6 +600,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 reduce_infos.append(self._reduce_adamw(group, world_size))
             elif group['kind'] == 'muon':
                 reduce_infos.append(self._reduce_muon(group, world_size))
+            elif group['kind'] == 'head_muon':
+                reduce_infos.append(self._reduce_head_muon(group, world_size))
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
@@ -526,6 +612,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 self._compute_adamw(group, info, gather_list, rank, world_size)
             elif group['kind'] == 'muon':
                 self._compute_muon(group, info, gather_list, rank)
+            elif group['kind'] == 'head_muon':
+                self._compute_head_muon(group, info)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
