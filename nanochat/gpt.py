@@ -330,12 +330,12 @@ class GPT(nn.Module):
 
         # Head-wise attention queries init to zero (gives uniform 1/H via softmax => neutral at init)
         # Temperatures init to sqrt(head_dim) (equivalent to standard dot-product scaling)
+        head_dim = self.config.n_embd // self.config.n_head
         if self.head_attn_queries is not None:
             self.head_attn_queries.zero_()
             self.head_attn_temps.fill_(head_dim ** 0.5)
 
         # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
 
@@ -444,7 +444,7 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        head_attn_numel = self.head_attn_queries.numel() if self.head_attn_queries is not None else 0
+        head_attn_numel = (self.head_attn_queries.numel() + self.head_attn_temps.numel()) if self.head_attn_queries is not None else 0
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() +
