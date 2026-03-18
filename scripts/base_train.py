@@ -55,6 +55,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 parser.add_argument("--head-attn", action="store_true", help="enable head-wise attention (AttnRes for heads)")
 parser.add_argument("--parallel-block", action="store_true", help="parallel attention+MLP (PaLM-style) instead of sequential")
 parser.add_argument("--factored-proj", action="store_true", help="dual output projections: one for logit path, one for composition")
+parser.add_argument("--factored-proj-ortho-alpha", type=float, default=0.05, help="orthogonality aux loss coefficient for factored proj")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -143,6 +144,7 @@ def build_model_meta(depth):
         head_attn=args.head_attn,
         parallel_block=args.parallel_block,
         factored_proj=args.factored_proj,
+        factored_proj_ortho_alpha=args.factored_proj_ortho_alpha,
     )
     with torch.device("meta"):
         model_meta = GPT(config)

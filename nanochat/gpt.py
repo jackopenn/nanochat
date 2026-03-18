@@ -40,6 +40,7 @@ class GPTConfig:
     head_attn: bool = False  # input-dependent head weighting (AttnRes for heads)
     parallel_block: bool = False  # parallel attention+MLP (PaLM-style) instead of sequential
     factored_proj: bool = False  # dual output projections: one for logit path, one for composition
+    factored_proj_ortho_alpha: float = 0.05  # orthogonality aux loss coefficient for factored proj
 
 
 def norm(x):
@@ -607,7 +608,7 @@ class GPT(nn.Module):
             # Factored projection: orthogonality aux loss to break symmetry between paths
             if self.config.factored_proj:
                 ortho = sum(block.attn.factored_output.ortho_loss() for block in self.transformer.h)
-                aux_loss = 0.05 * ortho / self.config.n_layer
+                aux_loss = self.config.factored_proj_ortho_alpha * ortho / self.config.n_layer
                 self._factored_proj_aux_loss = aux_loss.detach()
                 loss = loss + aux_loss
             return loss
