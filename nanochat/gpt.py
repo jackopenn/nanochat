@@ -37,6 +37,7 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    circuit_muon: bool = False
 
 
 def norm(x):
@@ -394,9 +395,32 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        # Circuit-aware Muon: pair OV and QK attention weights for joint orthogonalization
+        # Only when shapes are compatible (MHA: n_head == n_kv_head)
+        circuit_paired = set()
+        if self.config.circuit_muon and self.config.n_head == self.config.n_kv_head:
+            for block in self.transformer.h:
+                # OV pair: c_proj @ c_v^T forms the OV circuit
+                p_proj, p_v = block.attn.c_proj.weight, block.attn.c_v.weight
+                param_groups.append(dict(
+                    kind='ov_pair', params=[p_proj, p_v], lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                ))
+                circuit_paired.add(id(p_proj))
+                circuit_paired.add(id(p_v))
+                # QK pair: c_q^T @ c_k forms the QK circuit
+                p_q, p_k = block.attn.c_q.weight, block.attn.c_k.weight
+                param_groups.append(dict(
+                    kind='qk_pair', params=[p_q, p_k], lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                ))
+                circuit_paired.add(id(p_q))
+                circuit_paired.add(id(p_k))
+
+        # Muon groups (remaining matrix params, grouped by shape for stacking)
+        remaining_matrix_params = [p for p in matrix_params if id(p) not in circuit_paired]
+        for shape in sorted({p.shape for p in remaining_matrix_params}):
+            group_params = [p for p in remaining_matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,

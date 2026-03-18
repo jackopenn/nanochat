@@ -87,6 +87,23 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+def polar_express(g: Tensor, ns_steps: int = 5) -> Tensor:
+    """Standalone Polar Express orthogonalization (not compiled — used for circuit pairs with only 2 params)."""
+    X = g.bfloat16()
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    if X.size(-2) > X.size(-1):  # Tall matrix
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:  # Wide matrix
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    return X
+
+
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
@@ -280,6 +297,75 @@ class MuonAdamW(torch.optim.Optimizer):
         # Copy back to original params
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
+    def _step_circuit_pair(self, group: dict) -> None:
+        """
+        Circuit-aware Muon update for paired attention params (OV or QK circuits).
+
+        Instead of orthogonalizing grad(W_out) and grad(W_in) independently, we project
+        W_out's gradient into circuit space (W_out @ W_in^T for OV, W_out^T @ W_in^T for QK),
+        orthogonalize the circuit gradient, then use it as W_out's update.
+        W_in gets standard Polar Express treatment.
+        """
+        p_out, p_in = group['params']  # (c_proj, c_v) or (c_q, c_k)
+        kind = group['kind']
+        momentum_val = group['momentum']
+        ns_steps = group['ns_steps']
+        beta2 = group['beta2']
+        lr = group['lr']
+        wd = group['weight_decay']
+
+        # --- Momentum for each param individually ---
+        for p in [p_out, p_in]:
+            state = self.state[p]
+            if 'momentum_buffer' not in state:
+                state['momentum_buffer'] = torch.zeros_like(p)
+                # Factored second moment: per-row if tall, per-col if wide
+                if p.shape[-2] >= p.shape[-1]:
+                    state['second_momentum_buffer'] = torch.zeros(p.shape[-2], 1, dtype=p.dtype, device=p.device)
+                else:
+                    state['second_momentum_buffer'] = torch.zeros(1, p.shape[-1], dtype=p.dtype, device=p.device)
+            state['momentum_buffer'].lerp_(p.grad, 1 - momentum_val)
+
+        # --- Nesterov effective gradients ---
+        eff_out = p_out.grad.lerp_(self.state[p_out]['momentum_buffer'], momentum_val)
+        eff_in = p_in.grad.lerp_(self.state[p_in]['momentum_buffer'], momentum_val)
+
+        # --- Form circuit gradient and orthogonalize ---
+        if kind == 'ov_pair':
+            G_circuit = eff_out @ p_in.data.mT  # project into OV space
+        else:  # qk_pair
+            G_circuit = eff_out.mT @ p_in.data  # project into QK space
+
+        update_out = polar_express(G_circuit, ns_steps)
+        if kind == 'qk_pair':
+            update_out = update_out.mT
+
+        # Standard Polar Express for p_in
+        update_in = polar_express(eff_in, ns_steps)
+
+        # --- Variance reduction + cautious update for both ---
+        lr_scaled = lr * max(1.0, p_out.shape[-2] / p_out.shape[-1]) ** 0.5
+        for p, g in [(p_out, update_out), (p_in, update_in)]:
+            state = self.state[p]
+            red_dim = -1 if p.shape[-2] >= p.shape[-1] else -2
+            smb = state['second_momentum_buffer']
+
+            # Variance reduction (same logic as muon_step_fused)
+            v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+            red_dim_size = g.size(red_dim)
+            v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+            v_norm = v_norm_sq.sqrt()
+            smb.lerp_(v_mean.to(dtype=smb.dtype), 1 - beta2)
+            step_size = smb.clamp_min(1e-10).rsqrt()
+            scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+            v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+            final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+            g = g * final_scale.to(g.dtype)
+
+            # Cautious weight decay + parameter update
+            mask = (g * p.data) >= 0
+            p.data.sub_(lr_scaled * g + lr_scaled * wd * p.data * mask)
+
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
@@ -287,6 +373,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_adamw(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
+            elif group['kind'] in ('ov_pair', 'qk_pair'):
+                self._step_circuit_pair(group)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
@@ -496,6 +584,21 @@ class DistMuonAdamW(torch.optim.Optimizer):
         future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
+    def _reduce_circuit_pair(self, group: dict, world_size: int) -> dict:
+        """Launch async all_reduce for circuit pair group (only 2 params, simple all_reduce)."""
+        futures = []
+        for p in group['params']:
+            future = dist.all_reduce(p.grad, op=dist.ReduceOp.AVG, async_op=True).get_future()
+            futures.append(future)
+        return dict(futures=futures)
+
+    def _compute_circuit_pair(self, group: dict, info: dict) -> None:
+        """Wait for reduces, compute circuit-aware Muon update (runs on every rank)."""
+        for future in info['futures']:
+            future.wait()
+        # Reuse MuonAdamW's _step_circuit_pair logic
+        MuonAdamW._step_circuit_pair(self, group)
+
     def _finish_gathers(self, gather_list: list) -> None:
         """Wait for all gathers and copy Muon params back."""
         for info in gather_list:
@@ -516,6 +619,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 reduce_infos.append(self._reduce_adamw(group, world_size))
             elif group['kind'] == 'muon':
                 reduce_infos.append(self._reduce_muon(group, world_size))
+            elif group['kind'] in ('ov_pair', 'qk_pair'):
+                reduce_infos.append(self._reduce_circuit_pair(group, world_size))
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
@@ -526,6 +631,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 self._compute_adamw(group, info, gather_list, rank, world_size)
             elif group['kind'] == 'muon':
                 self._compute_muon(group, info, gather_list, rank)
+            elif group['kind'] in ('ov_pair', 'qk_pair'):
+                self._compute_circuit_pair(group, info)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
