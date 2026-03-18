@@ -421,8 +421,9 @@ class GPT(nn.Module):
             stats['head_attn/temp_mean'] = sum(temps) / len(temps)
             stats['head_attn/temp_first'] = temps[0]
             stats['head_attn/temp_last'] = temps[-1]
-        # Factored projection ortho loss
-        if self.config.factored_proj:
+        # Factored projection stats
+        if self.config.factored_proj and hasattr(self, '_factored_proj_aux_loss'):
+            stats['factored_proj/aux_loss'] = self._factored_proj_aux_loss.item()
             ortho_losses = [block.attn.factored_output.ortho_loss().item() for block in self.transformer.h]
             stats['factored_proj/ortho_loss_mean'] = sum(ortho_losses) / len(ortho_losses)
             stats['factored_proj/ortho_loss_first'] = ortho_losses[0]
@@ -606,7 +607,9 @@ class GPT(nn.Module):
             # Factored projection: orthogonality aux loss to break symmetry between paths
             if self.config.factored_proj:
                 ortho = sum(block.attn.factored_output.ortho_loss() for block in self.transformer.h)
-                loss = loss + 0.05 * ortho / self.config.n_layer
+                aux_loss = 0.05 * ortho / self.config.n_layer
+                self._factored_proj_aux_loss = aux_loss.detach()
+                loss = loss + aux_loss
             return loss
         else:
             # inference: just return the logits directly
