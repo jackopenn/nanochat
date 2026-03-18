@@ -476,7 +476,8 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() + (self.head_attn_queries.numel() if self.head_attn_queries is not None else 0)
+        head_attn_scalars = (self.head_attn_queries.numel() + self.head_attn_temps.numel()) if self.head_attn_queries is not None else 0
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() + head_attn_scalars
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -493,15 +494,21 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Factored output params are 3D (Muon requires 2D), so separate them for AdamW
+        factored_output_params = []
+        if self.config.factored_proj:
+            for block in self.transformer.h:
+                factored_output_params.extend(block.attn.factored_output.parameters())
+        factored_output_set = set(factored_output_params)
+        matrix_params = [p for p in self.transformer.h.parameters() if p not in factored_output_set]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        head_attn_query_params = [self.head_attn_queries] if self.head_attn_queries is not None else []
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(head_attn_query_params)
+        head_attn_query_params = [self.head_attn_queries, self.head_attn_temps] if self.head_attn_queries is not None else []
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(head_attn_query_params) + len(factored_output_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -517,6 +524,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
             *([dict(kind='adamw', params=head_attn_query_params, lr=scalar_lr * 0.1, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)] if head_attn_query_params else []),
+            *([dict(kind='adamw', params=factored_output_params, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.01)] if factored_output_params else []),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
