@@ -581,6 +581,7 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        log_data.update(orig_model.get_head_attn_stats())
         wandb_run.log(log_data)
 
     # state update

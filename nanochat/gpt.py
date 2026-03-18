@@ -128,6 +128,9 @@ class CausalSelfAttention(nn.Module):
             head_keys = F.rms_norm(y, (y.size(-1),))
             scores = torch.einsum('bthd,d->bth', head_keys, head_attn_query.to(y.dtype))
             alpha = F.softmax(scores, dim=-1)
+            # Stash lightweight summary stats for diagnostic logging (2 scalars, negligible overhead)
+            self._alpha_entropy = -(alpha * alpha.clamp(min=1e-8).log()).sum(-1).mean().detach()
+            self._alpha_max = alpha.max(-1).values.mean().detach()
             y = y * (self.n_head * alpha.unsqueeze(-1))
 
         # Re-assemble the heads and project back to residual stream
@@ -328,6 +331,30 @@ class GPT(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
+
+    def get_head_attn_stats(self):
+        """Collect head attention alpha stats from all layers for diagnostic logging."""
+        if self.head_attn_queries is None:
+            return {}
+        stats = {}
+        entropies = []
+        maxes = []
+        for i, block in enumerate(self.transformer.h):
+            attn = block.attn
+            if hasattr(attn, '_alpha_entropy'):
+                entropies.append(attn._alpha_entropy.item())
+                maxes.append(attn._alpha_max.item())
+        if entropies:
+            stats['head_attn/entropy_mean'] = sum(entropies) / len(entropies)
+            stats['head_attn/entropy_first'] = entropies[0]
+            stats['head_attn/entropy_last'] = entropies[-1]
+            stats['head_attn/alpha_max_mean'] = sum(maxes) / len(maxes)
+            stats['head_attn/alpha_max_first'] = maxes[0]
+            stats['head_attn/alpha_max_last'] = maxes[-1]
+            q_norms = [self.head_attn_queries[i].norm().item() for i in range(self.config.n_layer)]
+            stats['head_attn/query_norm_mean'] = sum(q_norms) / len(q_norms)
+            stats['head_attn/query_norm_max'] = max(q_norms)
+        return stats
 
     def estimate_flops(self):
         """
