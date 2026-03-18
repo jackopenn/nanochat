@@ -127,7 +127,7 @@ class CausalSelfAttention(nn.Module):
         if head_attn_query is not None:
             head_keys = F.rms_norm(y, (y.size(-1),))
             scores = torch.einsum('bthd,d->bth', head_keys, head_attn_query.to(y.dtype))
-            alpha = F.softmax(scores, dim=-1)
+            alpha = F.softmax(scores / (self.head_dim ** 0.5), dim=-1)
             # Stash lightweight summary stats for diagnostic logging (2 scalars, negligible overhead)
             self._alpha_entropy = -(alpha * alpha.clamp(min=1e-8).log()).sum(-1).mean().detach()
             self._alpha_max = alpha.max(-1).values.mean().detach()
