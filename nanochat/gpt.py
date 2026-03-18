@@ -87,14 +87,15 @@ class FactoredOutputProjection(nn.Module):
 
     def forward(self, y):
         """y: (B, T, H, D) -> output: (B, T, d_model)"""
+        B, T, H, D = y.shape
         # Cast weights to activation dtype (like Linear class does)
         dl, ul = self.down_logit.to(y.dtype), self.up_logit.to(y.dtype)
         dc, uc = self.down_compose.to(y.dtype), self.up_compose.to(y.dtype)
-        logit = torch.einsum('bthd,hdr->bthr', y, dl)
-        logit = torch.einsum('bthr,hrm->bthm', logit, ul)
-        compose = torch.einsum('bthd,hdr->bthr', y, dc)
-        compose = torch.einsum('bthr,hrm->bthm', compose, uc)
-        return (logit + compose).sum(dim=2)
+        # Fuse low-rank factors into single weight: (H, D, r) @ (H, r, M) -> (H, D, M)
+        W = torch.bmm(dl, ul) + torch.bmm(dc, uc)
+        # Single matmul, same as standard c_proj
+        y = y.contiguous().view(B, T, H * D)
+        return y @ W.reshape(H * D, -1)
 
     def ortho_loss(self):
         """Penalize overlap between logit and compose write subspaces."""
@@ -605,6 +606,7 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            self._ntp_loss = loss.detach()
             # Factored projection: orthogonality aux loss to break symmetry between paths
             if self.config.factored_proj:
                 ortho = sum(block.attn.factored_output.ortho_loss() for block in self.transformer.h)

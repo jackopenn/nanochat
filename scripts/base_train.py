@@ -517,7 +517,7 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
-        train_loss = loss.detach() # for logging
+        train_loss = orig_model._ntp_loss # for logging (NTP loss only, excludes aux losses)
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
