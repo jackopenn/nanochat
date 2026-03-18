@@ -326,7 +326,7 @@ class MuonAdamW(torch.optim.Optimizer):
         # Fill 0-D tensors — LR scaling uses per-head shape
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"])
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, m / n) ** 0.5)
+        self._muon_lr_t.fill_(group["lr"])
         self._muon_wd_t.fill_(group["weight_decay"])
 
         # Fused Muon step on per-head tensors
