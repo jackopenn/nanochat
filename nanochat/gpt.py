@@ -65,6 +65,46 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+class FactoredOutputProjection(nn.Module):
+    """Per-head low-rank factored output projection with dual paths.
+    Replaces standard W_O with two rank-constrained paths:
+      logit path:   down_logit @ up_logit   (writes to unembedding-aligned subspace)
+      compose path: down_compose @ up_compose (writes to composition-aligned subspace)
+    An orthogonality loss between the paths breaks symmetry so they specialize."""
+
+    def __init__(self, n_head, d_head, d_model, rank_ratio=0.5):
+        super().__init__()
+        total_rank = d_head
+        self.r_l = max(1, int(total_rank * rank_ratio))
+        self.r_c = max(1, total_rank - self.r_l)
+        # Logit path: per-head [d_head, r_l] @ [r_l, d_model]
+        self.down_logit = nn.Parameter(torch.empty(n_head, d_head, self.r_l))
+        self.up_logit = nn.Parameter(torch.empty(n_head, self.r_l, d_model))
+        # Compose path: per-head [d_head, r_c] @ [r_c, d_model]
+        self.down_compose = nn.Parameter(torch.empty(n_head, d_head, self.r_c))
+        self.up_compose = nn.Parameter(torch.empty(n_head, self.r_c, d_model))
+
+    def forward(self, y):
+        """y: (B, T, H, D) -> output: (B, T, d_model)"""
+        # Cast weights to activation dtype (like Linear class does)
+        dl, ul = self.down_logit.to(y.dtype), self.up_logit.to(y.dtype)
+        dc, uc = self.down_compose.to(y.dtype), self.up_compose.to(y.dtype)
+        logit = torch.einsum('bthd,hdr->bthr', y, dl)
+        logit = torch.einsum('bthr,hrm->bthm', logit, ul)
+        compose = torch.einsum('bthd,hdr->bthr', y, dc)
+        compose = torch.einsum('bthr,hrm->bthm', compose, uc)
+        return (logit + compose).sum(dim=2)
+
+    def ortho_loss(self):
+        """Penalize overlap between logit and compose write subspaces."""
+        # cross-correlation: (H, r_l, r_c)
+        cross = torch.matmul(self.up_logit, self.up_compose.transpose(-1, -2))
+        norm_l = self.up_logit.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        norm_c = self.up_compose.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        cross_norm = cross / (norm_l @ norm_c.transpose(-1, -2))
+        return cross_norm.pow(2).mean()
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -78,9 +118,13 @@ class CausalSelfAttention(nn.Module):
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
-        # Factored output projection: separate W_O for direct logit path vs downstream composition
-        self.c_proj_logit = Linear(self.n_embd, self.n_embd, bias=False) if config.factored_proj else None
+        # Output projection: standard W_O or factored dual-path version
+        if config.factored_proj:
+            self.c_proj = None
+            self.factored_output = FactoredOutputProjection(self.n_head, self.head_dim, self.n_embd)
+        else:
+            self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+            self.factored_output = None
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -138,10 +182,10 @@ class CausalSelfAttention(nn.Module):
             y = y * (self.n_head * alpha.unsqueeze(-1))
 
         # Re-assemble the heads and project back to residual stream
-        y = y.contiguous().view(B, T, -1)
-        if self.c_proj_logit is not None:
-            y = self.c_proj(y) + self.c_proj_logit(y)
+        if self.factored_output is not None:
+            y = self.factored_output(y)  # (B, T, H, D) -> (B, T, d_model)
         else:
+            y = y.contiguous().view(B, T, -1)
             y = self.c_proj(y)
         return y
 
@@ -253,9 +297,16 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            if block.attn.c_proj_logit is not None:
-                torch.nn.init.zeros_(block.attn.c_proj_logit.weight)
+            if block.attn.c_proj is not None:
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if block.attn.factored_output is not None:
+                # down reads from d_head space: init like c_v
+                s_head = 3**0.5 * block.attn.factored_output.down_logit.shape[1]**-0.5
+                torch.nn.init.uniform_(block.attn.factored_output.down_logit, -s_head, s_head)
+                torch.nn.init.uniform_(block.attn.factored_output.down_compose, -s_head, s_head)
+                # up writes to residual stream: zero init (neutral, like c_proj)
+                torch.nn.init.zeros_(block.attn.factored_output.up_logit)
+                torch.nn.init.zeros_(block.attn.factored_output.up_compose)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -370,6 +421,12 @@ class GPT(nn.Module):
             stats['head_attn/temp_mean'] = sum(temps) / len(temps)
             stats['head_attn/temp_first'] = temps[0]
             stats['head_attn/temp_last'] = temps[-1]
+        # Factored projection ortho loss
+        if self.config.factored_proj:
+            ortho_losses = [block.attn.factored_output.ortho_loss().item() for block in self.transformer.h]
+            stats['factored_proj/ortho_loss_mean'] = sum(ortho_losses) / len(ortho_losses)
+            stats['factored_proj/ortho_loss_first'] = ortho_losses[0]
+            stats['factored_proj/ortho_loss_last'] = ortho_losses[-1]
         return stats
 
     def estimate_flops(self):
@@ -538,6 +595,10 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            # Factored projection: orthogonality aux loss to break symmetry between paths
+            if self.config.factored_proj:
+                ortho = sum(block.attn.factored_output.ortho_loss() for block in self.transformer.h)
+                loss = loss + 0.05 * ortho / self.config.n_layer
             return loss
         else:
             # inference: just return the logits directly
