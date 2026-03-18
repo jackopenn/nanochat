@@ -39,6 +39,7 @@ class GPTConfig:
     window_pattern: str = "SSSL"
     head_attn: bool = False  # input-dependent head weighting (AttnRes for heads)
     parallel_block: bool = False  # parallel attention+MLP (PaLM-style) instead of sequential
+    factored_proj: bool = False  # dual output projections: one for logit path, one for composition
 
 
 def norm(x):
@@ -78,6 +79,8 @@ class CausalSelfAttention(nn.Module):
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        # Factored output projection: separate W_O for direct logit path vs downstream composition
+        self.c_proj_logit = Linear(self.n_embd, self.n_embd, bias=False) if config.factored_proj else None
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
@@ -125,9 +128,10 @@ class CausalSelfAttention(nn.Module):
         # Head-wise attention: input-dependent head weighting (AttnRes for heads)
         # At init (query=0), softmax gives uniform 1/H, so n_head * 1/H = 1.0 per head (exact standard MHA)
         if head_attn_query is not None:
+            query, temp = head_attn_query
             head_keys = F.rms_norm(y, (y.size(-1),))
-            scores = torch.einsum('bthd,d->bth', head_keys, head_attn_query.to(y.dtype))
-            alpha = F.softmax(scores / (self.head_dim ** 0.5), dim=-1)
+            scores = torch.einsum('bthd,d->bth', head_keys, query.to(y.dtype))
+            alpha = F.softmax(scores / temp, dim=-1)
             # Stash lightweight summary stats for diagnostic logging (2 scalars, negligible overhead)
             self._alpha_entropy = -(alpha * alpha.clamp(min=1e-8).log()).sum(-1).mean().detach()
             self._alpha_max = alpha.max(-1).values.mean().detach()
@@ -135,7 +139,10 @@ class CausalSelfAttention(nn.Module):
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
+        if self.c_proj_logit is not None:
+            y = self.c_proj(y) + self.c_proj_logit(y)
+        else:
+            y = self.c_proj(y)
         return y
 
 
@@ -206,8 +213,9 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
-        # Head-wise attention: per-layer query vectors for input-dependent head weighting (AttnRes for heads)
+        # Head-wise attention: per-layer query vectors and temperatures for input-dependent head weighting
         self.head_attn_queries = nn.Parameter(torch.zeros(config.n_layer, head_dim)) if config.head_attn else None
+        self.head_attn_temps = nn.Parameter(torch.ones(config.n_layer)) if config.head_attn else None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -246,6 +254,8 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if block.attn.c_proj_logit is not None:
+                torch.nn.init.zeros_(block.attn.c_proj_logit.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -268,8 +278,10 @@ class GPT(nn.Module):
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
         # Head-wise attention queries init to zero (gives uniform 1/H via softmax => neutral at init)
+        # Temperatures init to sqrt(head_dim) (equivalent to standard dot-product scaling)
         if self.head_attn_queries is not None:
             self.head_attn_queries.zero_()
+            self.head_attn_temps.fill_(head_dim ** 0.5)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -354,6 +366,10 @@ class GPT(nn.Module):
             q_norms = [self.head_attn_queries[i].norm().item() for i in range(self.config.n_layer)]
             stats['head_attn/query_norm_mean'] = sum(q_norms) / len(q_norms)
             stats['head_attn/query_norm_max'] = max(q_norms)
+            temps = [self.head_attn_temps[i].item() for i in range(self.config.n_layer)]
+            stats['head_attn/temp_mean'] = sum(temps) / len(temps)
+            stats['head_attn/temp_first'] = temps[0]
+            stats['head_attn/temp_last'] = temps[-1]
         return stats
 
     def estimate_flops(self):
@@ -502,7 +518,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            head_attn_query = self.head_attn_queries[i] if self.head_attn_queries is not None else None
+            head_attn_query = (self.head_attn_queries[i], self.head_attn_temps[i]) if self.head_attn_queries is not None else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, head_attn_query)
             if i == backout_layer:
                 x_backout = x
