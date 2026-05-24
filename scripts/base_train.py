@@ -52,6 +52,10 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--head-attn", action="store_true", help="enable head-wise attention (AttnRes for heads)")
+parser.add_argument("--parallel-block", action="store_true", help="parallel attention+MLP (PaLM-style) instead of sequential")
+parser.add_argument("--factored-proj", action="store_true", help="dual output projections: one for logit path, one for composition")
+parser.add_argument("--factored-proj-ortho-alpha", type=float, default=0.05, help="orthogonality aux loss coefficient for factored proj")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,6 +141,10 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        head_attn=args.head_attn,
+        parallel_block=args.parallel_block,
+        factored_proj=args.factored_proj,
+        factored_proj_ortho_alpha=args.factored_proj_ortho_alpha,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -356,7 +364,7 @@ print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
+# Learning rate schedule (linear warmup, constant, cosine warmdown)
 def get_lr_multiplier(it):
     warmup_iters = args.warmup_steps
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
@@ -365,8 +373,9 @@ def get_lr_multiplier(it):
     elif it <= num_iterations - warmdown_iters:
         return 1.0
     else:
-        progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+        decay = (it - (num_iterations - warmdown_iters)) / warmdown_iters  # 0→1
+        cos_decay = 0.5 * (1 + math.cos(math.pi * decay))  # 1→0 (cosine)
+        return cos_decay * (1.0 - args.final_lr_frac) + args.final_lr_frac
 
 # Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
@@ -509,7 +518,7 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         loss = model(x, y)
-        train_loss = loss.detach() # for logging
+        train_loss = orig_model._ntp_loss # for logging (NTP loss only, excludes aux losses)
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -564,7 +573,10 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    aux_str = ""
+    if args.factored_proj and hasattr(orig_model, '_factored_proj_aux_loss'):
+        aux_str = f" | aux: {orig_model._factored_proj_aux_loss.item():.6f}"
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f}{aux_str} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -577,6 +589,7 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        log_data.update(orig_model.get_head_attn_stats())
         wandb_run.log(log_data)
 
     # state update

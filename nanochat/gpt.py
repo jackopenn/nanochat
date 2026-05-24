@@ -37,6 +37,10 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    head_attn: bool = False  # input-dependent head weighting (AttnRes for heads)
+    parallel_block: bool = False  # parallel attention+MLP (PaLM-style) instead of sequential
+    factored_proj: bool = False  # dual output projections: one for logit path, one for composition
+    factored_proj_ortho_alpha: float = 0.05  # orthogonality aux loss coefficient for factored proj
 
 
 def norm(x):
@@ -62,6 +66,47 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+class FactoredOutputProjection(nn.Module):
+    """Per-head low-rank factored output projection with dual paths.
+    Replaces standard W_O with two rank-constrained paths:
+      logit path:   down_logit @ up_logit   (writes to unembedding-aligned subspace)
+      compose path: down_compose @ up_compose (writes to composition-aligned subspace)
+    An orthogonality loss between the paths breaks symmetry so they specialize."""
+
+    def __init__(self, n_head, d_head, d_model, rank_ratio=0.5):
+        super().__init__()
+        total_rank = d_head
+        self.r_l = max(1, int(total_rank * rank_ratio))
+        self.r_c = max(1, total_rank - self.r_l)
+        # Logit path: per-head [d_head, r_l] @ [r_l, d_model]
+        self.down_logit = nn.Parameter(torch.empty(n_head, d_head, self.r_l))
+        self.up_logit = nn.Parameter(torch.empty(n_head, self.r_l, d_model))
+        # Compose path: per-head [d_head, r_c] @ [r_c, d_model]
+        self.down_compose = nn.Parameter(torch.empty(n_head, d_head, self.r_c))
+        self.up_compose = nn.Parameter(torch.empty(n_head, self.r_c, d_model))
+
+    def forward(self, y):
+        """y: (B, T, H, D) -> output: (B, T, d_model)"""
+        B, T, H, D = y.shape
+        # Cast weights to activation dtype (like Linear class does)
+        dl, ul = self.down_logit.to(y.dtype), self.up_logit.to(y.dtype)
+        dc, uc = self.down_compose.to(y.dtype), self.up_compose.to(y.dtype)
+        # Fuse low-rank factors into single weight: (H, D, r) @ (H, r, M) -> (H, D, M)
+        W = torch.bmm(dl, ul) + torch.bmm(dc, uc)
+        # Single matmul, same as standard c_proj
+        y = y.contiguous().view(B, T, H * D)
+        return y @ W.reshape(H * D, -1)
+
+    def ortho_loss(self):
+        """Penalize overlap between logit and compose write subspaces."""
+        # cross-correlation: (H, r_l, r_c)
+        cross = torch.matmul(self.up_logit, self.up_compose.transpose(-1, -2))
+        norm_l = self.up_logit.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        norm_c = self.up_compose.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        cross_norm = cross / (norm_l @ norm_c.transpose(-1, -2))
+        return cross_norm.pow(2).mean()
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -75,11 +120,17 @@ class CausalSelfAttention(nn.Module):
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        # Output projection: standard W_O or factored dual-path version
+        if config.factored_proj:
+            self.c_proj = None
+            self.factored_output = FactoredOutputProjection(self.n_head, self.head_dim, self.n_embd)
+        else:
+            self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+            self.factored_output = None
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, head_attn_query):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -120,9 +171,24 @@ class CausalSelfAttention(nn.Module):
             if self.layer_idx == kv_cache.n_layers - 1:
                 kv_cache.advance(T)
 
+        # Head-wise attention: input-dependent head weighting (AttnRes for heads)
+        # At init (query=0), softmax gives uniform 1/H, so n_head * 1/H = 1.0 per head (exact standard MHA)
+        if head_attn_query is not None:
+            query, temp = head_attn_query
+            head_keys = F.rms_norm(y, (y.size(-1),))
+            scores = torch.einsum('bthd,d->bth', head_keys, query.to(y.dtype))
+            alpha = F.softmax(scores / temp, dim=-1)
+            # Stash lightweight summary stats for diagnostic logging (2 scalars, negligible overhead)
+            self._alpha_entropy = -(alpha * alpha.clamp(min=1e-8).log()).sum(-1).mean().detach()
+            self._alpha_max = alpha.max(-1).values.mean().detach()
+            y = y * (self.n_head * alpha.unsqueeze(-1))
+
         # Re-assemble the heads and project back to residual stream
-        y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
+        if self.factored_output is not None:
+            y = self.factored_output(y)  # (B, T, H, D) -> (B, T, d_model)
+        else:
+            y = y.contiguous().view(B, T, -1)
+            y = self.c_proj(y)
         return y
 
 
@@ -144,10 +210,15 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.parallel = config.parallel_block
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, head_attn_query):
+        if self.parallel:
+            nx = norm(x)
+            x = x + self.attn(nx, ve, cos_sin, window_size, kv_cache, head_attn_query) + self.mlp(nx)
+        else:
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, head_attn_query)
+            x = x + self.mlp(norm(x))
         return x
 
 
@@ -188,6 +259,9 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # Head-wise attention: per-layer query vectors and temperatures for input-dependent head weighting
+        self.head_attn_queries = nn.Parameter(torch.zeros(config.n_layer, head_dim)) if config.head_attn else None
+        self.head_attn_temps = nn.Parameter(torch.ones(config.n_layer)) if config.head_attn else None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -225,7 +299,16 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if block.attn.c_proj is not None:
+                torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
+            if block.attn.factored_output is not None:
+                # down reads from d_head space: init like c_v
+                s_head = 3**0.5 * block.attn.factored_output.down_logit.shape[1]**-0.5
+                torch.nn.init.uniform_(block.attn.factored_output.down_logit, -s_head, s_head)
+                torch.nn.init.uniform_(block.attn.factored_output.down_compose, -s_head, s_head)
+                # up writes to residual stream: zero init (neutral, like c_proj)
+                torch.nn.init.zeros_(block.attn.factored_output.up_logit)
+                torch.nn.init.zeros_(block.attn.factored_output.up_compose)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
@@ -252,8 +335,14 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
-        # Rotary embeddings
+        # Head-wise attention queries init to zero (gives uniform 1/H via softmax => neutral at init)
+        # Temperatures init to sqrt(head_dim) (equivalent to standard dot-product scaling)
         head_dim = self.config.n_embd // self.config.n_head
+        if self.head_attn_queries is not None:
+            self.head_attn_queries.zero_()
+            self.head_attn_temps.fill_(head_dim ** 0.5)
+
+        # Rotary embeddings
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
 
@@ -266,7 +355,6 @@ class GPT(nn.Module):
                 ve.to(dtype=COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
-        # TODO: bump base theta more? e.g. 100K is more common more recently
         # autodetect the device from model embeddings
         if device is None:
             device = self.transformer.wte.weight.device
@@ -314,6 +402,41 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def get_head_attn_stats(self):
+        """Collect head attention alpha stats from all layers for diagnostic logging."""
+        if self.head_attn_queries is None:
+            return {}
+        stats = {}
+        entropies = []
+        maxes = []
+        for i, block in enumerate(self.transformer.h):
+            attn = block.attn
+            if hasattr(attn, '_alpha_entropy'):
+                entropies.append(attn._alpha_entropy.item())
+                maxes.append(attn._alpha_max.item())
+        if entropies:
+            stats['head_attn/entropy_mean'] = sum(entropies) / len(entropies)
+            stats['head_attn/entropy_first'] = entropies[0]
+            stats['head_attn/entropy_last'] = entropies[-1]
+            stats['head_attn/alpha_max_mean'] = sum(maxes) / len(maxes)
+            stats['head_attn/alpha_max_first'] = maxes[0]
+            stats['head_attn/alpha_max_last'] = maxes[-1]
+            q_norms = [self.head_attn_queries[i].norm().item() for i in range(self.config.n_layer)]
+            stats['head_attn/query_norm_mean'] = sum(q_norms) / len(q_norms)
+            stats['head_attn/query_norm_max'] = max(q_norms)
+            temps = [self.head_attn_temps[i].item() for i in range(self.config.n_layer)]
+            stats['head_attn/temp_mean'] = sum(temps) / len(temps)
+            stats['head_attn/temp_first'] = temps[0]
+            stats['head_attn/temp_last'] = temps[-1]
+        # Factored projection stats
+        if self.config.factored_proj and hasattr(self, '_factored_proj_aux_loss'):
+            stats['factored_proj/aux_loss'] = self._factored_proj_aux_loss.item()
+            ortho_losses = [block.attn.factored_output.ortho_loss().item() for block in self.transformer.h]
+            stats['factored_proj/ortho_loss_mean'] = sum(ortho_losses) / len(ortho_losses)
+            stats['factored_proj/ortho_loss_first'] = ortho_losses[0]
+            stats['factored_proj/ortho_loss_last'] = ortho_losses[-1]
+        return stats
+
     def estimate_flops(self):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
@@ -329,9 +452,11 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        head_attn_numel = (self.head_attn_queries.numel() + self.head_attn_temps.numel()) if self.head_attn_queries is not None else 0
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() +
+                          head_attn_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -359,7 +484,8 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
+        head_attn_scalars = (self.head_attn_queries.numel() + self.head_attn_temps.numel()) if self.head_attn_queries is not None else 0
+        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel() + head_attn_scalars
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
@@ -376,14 +502,21 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Factored output params are 3D (Muon requires 2D), so separate them for AdamW
+        factored_output_params = []
+        if self.config.factored_proj:
+            for block in self.transformer.h:
+                factored_output_params.extend(block.attn.factored_output.parameters())
+        factored_output_set = set(factored_output_params)
+        matrix_params = [p for p in self.transformer.h.parameters() if p not in factored_output_set]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        head_attn_query_params = [self.head_attn_queries, self.head_attn_temps] if self.head_attn_queries is not None else []
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(head_attn_query_params) + len(factored_output_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -398,6 +531,8 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            *([dict(kind='adamw', params=head_attn_query_params, lr=scalar_lr * 0.1, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)] if head_attn_query_params else []),
+            *([dict(kind='adamw', params=factored_output_params, lr=matrix_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.01)] if factored_output_params else []),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
@@ -456,7 +591,8 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            head_attn_query = (self.head_attn_queries[i], self.head_attn_temps[i]) if self.head_attn_queries is not None else None
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, head_attn_query)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -475,6 +611,13 @@ class GPT(nn.Module):
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            self._ntp_loss = loss.detach()
+            # Factored projection: orthogonality aux loss to break symmetry between paths
+            if self.config.factored_proj:
+                ortho = sum(block.attn.factored_output.ortho_loss() for block in self.transformer.h)
+                aux_loss = self.config.factored_proj_ortho_alpha * ortho / self.config.n_layer
+                self._factored_proj_aux_loss = aux_loss.detach()
+                loss = loss + aux_loss
             return loss
         else:
             # inference: just return the logits directly
