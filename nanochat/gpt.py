@@ -37,6 +37,7 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    head_muon: bool = False
 
 
 def norm(x):
@@ -399,9 +400,33 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        # Per-head Muon: orthogonalize attention weights per-head instead of per-matrix
+        head_muon_ids = set()
+        if self.config.head_muon:
+            head_dim = self.config.n_embd // self.config.n_head
+            qkv_params, proj_params = [], []
+            for block in self.transformer.h:
+                for p in [block.attn.c_q.weight, block.attn.c_k.weight, block.attn.c_v.weight]:
+                    qkv_params.append(p)
+                    head_muon_ids.add(id(p))
+                proj_params.append(block.attn.c_proj.weight)
+                head_muon_ids.add(id(block.attn.c_proj.weight))
+
+            param_groups.append(dict(
+                kind='head_muon', params=qkv_params, lr=matrix_lr,
+                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                head_dim=head_dim, reshape='qkv',
+            ))
+            param_groups.append(dict(
+                kind='head_muon', params=proj_params, lr=matrix_lr,
+                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                head_dim=head_dim, reshape='proj',
+            ))
+
+        # Muon groups (remaining matrix params, grouped by shape for stacking)
+        remaining_matrix_params = [p for p in matrix_params if id(p) not in head_muon_ids]
+        for shape in sorted({p.shape for p in remaining_matrix_params}):
+            group_params = [p for p in remaining_matrix_params if p.shape == shape]
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
